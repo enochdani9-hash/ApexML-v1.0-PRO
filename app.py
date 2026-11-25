@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import json
 import hmac
 import hashlib
@@ -19,7 +18,10 @@ STATE_FILE = "apexml_v1_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
-TRADING_COINS = ["SUI_USDT", "SOL_USDT", "ARB_USDT"]
+TRADING_COINS = [
+    "SUI_USDT", "SOL_USDT", "ARB_USDT",
+    "NEAR_USDT", "FET_USDT", "DOGE_USDT"
+]
 MACRO_COIN = "BTC_USDT"
 HORIZON_HOURS = 16
 RETRAIN_INTERVAL_SEC = 6 * 3600  # Retrains ML models every 6 hours
@@ -33,7 +35,7 @@ adapter = HTTPAdapter(
 HTTP_SESSION.mount("https://", adapter)
 
 CONTRACT_META_CACHE = {}
-LIVE_MODELS = {}  # In-memory trained models: { pair: {"model": clf, "classes": list} }
+LIVE_MODELS = {}
 
 DEFAULT_STATE = {
     "mode": "PAPER",
@@ -55,9 +57,9 @@ DEFAULT_STATE = {
     "circuit_breaker_until": 0.0,
     "last_trained_ts": 0.0,
     "last_trained_str": "Not Trained Yet",
-    "model_reports": {},            # Per-coin walk-forward backtest + live probabilities
-    "active_positions": {},         # Currently open trades
-    "trade_history": [],            # Closed trades
+    "model_reports": {},
+    "active_positions": {},
+    "trade_history": [],
     "stats": {
         "paper_trades": 0,
         "paper_wins": 0,
@@ -318,11 +320,6 @@ def build_feature_matrix(candles, btc_lookup):
 
 
 def build_triple_barrier_labels(closes, highs, lows, tp_pct, sl_pct, horizon=HORIZON_HOURS):
-    """
-    Class 1 = Clean LONG win (+tp_pct hit before -sl_pct)
-    Class 2 = Clean SHORT win (-tp_pct hit before +sl_pct)
-    Class 0 = HOLD / CHOP (neither hit cleanly)
-    """
     n = len(closes)
     y = np.zeros(n, dtype=int)
     tp_mult = tp_pct / 100.0
@@ -385,7 +382,6 @@ def train_and_evaluate_coin(pair, btc_lookup, tp_pct, sl_pct, leverage, conf_thr
     if len(np.unique(y_train)) < 2:
         raise ValueError(f"Insufficient class variety for {pair}")
 
-    # 1) Walk-Forward Validation Model (trains ONLY on first 75%)
     val_clf = HistGradientBoostingClassifier(
         max_iter=80,
         max_depth=4,
@@ -395,7 +391,6 @@ def train_and_evaluate_coin(pair, btc_lookup, tp_pct, sl_pct, leverage, conf_thr
     )
     val_clf.fit(X_train, y_train)
 
-    # Simulate real trades on the unseen last 25% of candles
     bt_trades = 0
     bt_wins = 0
     bt_net_pct = 0.0
@@ -445,7 +440,6 @@ def train_and_evaluate_coin(pair, btc_lookup, tp_pct, sl_pct, leverage, conf_thr
         else:
             i += 1
 
-    # 2) Final Production Model (retrained on ALL labeled data up to latest closed horizon)
     prod_clf = HistGradientBoostingClassifier(
         max_iter=80,
         max_depth=4,
@@ -456,7 +450,6 @@ def train_and_evaluate_coin(pair, btc_lookup, tp_pct, sl_pct, leverage, conf_thr
     prod_clf.fit(X[start_idx:end_labeled], y[start_idx:end_labeled])
     LIVE_MODELS[pair] = prod_clf
 
-    # Live prediction on the most recent closed candle (index -2 to avoid repainting)
     p_hold, p_long, p_short = extract_class_probs(prod_clf, X[-2:-1])
     sig = "HOLD"
     if p_long * 100.0 >= conf_thresh and p_long > p_short:
@@ -464,7 +457,10 @@ def train_and_evaluate_coin(pair, btc_lookup, tp_pct, sl_pct, leverage, conf_thr
     elif p_short * 100.0 >= conf_thresh and p_short > p_long:
         sig = "SHORT"
 
+    # WALK-FORWARD QUALITY GATE: Auto-mute any coin with Unseen PnL <= 0% or 0 test trades
+    is_muted = bool(bt_net_pct <= 0.0 or bt_trades == 0)
     win_rate = round((bt_wins / bt_trades) * 100.0, 1) if bt_trades > 0 else 0.0
+
     return {
         "pair": pair,
         "live_price": closes[-1],
@@ -472,6 +468,7 @@ def train_and_evaluate_coin(pair, btc_lookup, tp_pct, sl_pct, leverage, conf_thr
         "prob_short": round(p_short * 100.0, 1),
         "prob_hold": round(p_hold * 100.0, 1),
         "signal": sig,
+        "muted": is_muted,
         "bt_trades": bt_trades,
         "bt_wins": bt_wins,
         "bt_win_rate": win_rate,
@@ -504,12 +501,15 @@ def retrain_all_models():
     try:
         btc_lookup = build_btc_lookup()
         reports = {}
+        approved_cnt = 0
         for pair in TRADING_COINS:
             try:
                 rep = train_and_evaluate_coin(
                     pair, btc_lookup, tp_pct, sl_pct, leverage, conf_thresh, fee_pct
                 )
                 reports[pair] = rep
+                if not rep["muted"]:
+                    approved_cnt += 1
             except Exception as e:
                 with state_lock:
                     add_log(f"⚠️ Train notice [{pair}]: {str(e)[:65]}")
@@ -519,7 +519,7 @@ def retrain_all_models():
             STATE["last_trained_ts"] = time.time()
             STATE["last_trained_str"] = datetime.utcnow().strftime("%H:%M:%S UTC")
             add_log(
-                f"🧠 Trained Gradient Boosting models on {len(reports)} coins (1h Gate.io Futures + BTC Macro Context)."
+                f"🧠 Trained {len(reports)} coins — {approved_cnt} APPROVED, {len(reports) - approved_cnt} AUTO-MUTED by Quality Gate."
             )
             save_state()
     except Exception as e:
@@ -528,7 +528,7 @@ def retrain_all_models():
 
 
 # =============================================================================
-# LIVE & PAPER TRADING ENGINE
+# LIVE & PAPER TRADING ENGINE (WITH QUALITY GATE ENFORCEMENT)
 # =============================================================================
 def run_engine_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
@@ -546,7 +546,6 @@ def run_engine_cycle(force_manual=False):
             sl_pct = float(STATE.get("sl_pct", 2.0))
             conf_thresh = float(STATE.get("confidence_threshold", 65.0))
             fee_pct = float(STATE.get("futures_fee_pct", 0.12))
-            max_losses = int(STATE.get("max_consecutive_losses", 2))
             cb_until = float(STATE.get("circuit_breaker_until", 0.0))
 
         if need_train:
@@ -612,7 +611,7 @@ def run_engine_cycle(force_manual=False):
             if hit_reason:
                 close_position(pair, live_px, hit_reason)
 
-        # 2) CHECK FOR NEW HIGH-CONFIDENCE ML ENTRIES
+        # 2) CHECK FOR NEW HIGH-CONFIDENCE ML ENTRIES (APPROVED MODELS ONLY!)
         breaker_active = now_ts < cb_until
         if not breaker_active:
             with state_lock:
@@ -628,6 +627,10 @@ def run_engine_cycle(force_manual=False):
                 with state_lock:
                     rep["live_price"] = live_px
 
+                # QUALITY GATE: Skip muted/weak models
+                if rep.get("muted", True):
+                    continue
+
                 sig = rep.get("signal", "HOLD")
                 if sig not in ("LONG", "SHORT"):
                     continue
@@ -636,7 +639,6 @@ def run_engine_cycle(force_manual=False):
                 if conf_val < conf_thresh:
                     continue
 
-                # Open Trade (Paper or Live)
                 if mode == "PAPER":
                     with state_lock:
                         avail = float(STATE.get("paper_balance_usdt", 0.0))
@@ -663,7 +665,7 @@ def run_engine_cycle(force_manual=False):
                         }
                         add_log(
                             f"⚡ [PAPER {sig}][{pair}] {leverage}x ${slot_size:.2f} @ {fmt_px(live_px)} "
-                            f"(Conf: {conf_val}% | TP: {fmt_px(tp_px)} | SL: {fmt_px(sl_px)})"
+                            f"(Conf: {conf_val}% | Approved Edge: +{rep['bt_net_pct']}%)"
                         )
                 elif mode == "LIVE" and has_keys:
                     avail_fut = float(STATE.get("live_futures_usdt", 0.0))
@@ -675,7 +677,7 @@ def run_engine_cycle(force_manual=False):
                     num_c = max(1, int(round(notional / max(1e-9, c_val))))
                     signed_c = num_c if sig == "LONG" else -num_c
                     set_isolated_leverage(pair, leverage)
-                    code, resp = place_futures_order(pair, signed_c, reduce_only=False)
+                    code, _ = place_futures_order(pair, signed_c, reduce_only=False)
                     if code in (200, 201):
                         actual_margin = round((num_c * c_val) / leverage, 4)
                         tp_px = live_px * (1.0 + tp_pct / 100.0) if sig == "LONG" else live_px * (1.0 - tp_pct / 100.0)
@@ -778,7 +780,7 @@ def close_position(pair, exit_px, reason):
 
 def background_worker():
     load_state()
-    add_log("🧠 ApexML v1.0 PRO Online — 1h Gradient Boosting Engine (Walk-Forward Validated).")
+    add_log("🧠 ApexML v1.1 PRO Online — 6-Coin Scanner + Auto-Mute Quality Gate Active.")
     while True:
         run_engine_cycle(force_manual=False)
         time.sleep(10.0)
@@ -804,11 +806,11 @@ def check_worker():
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
-        "name": "ApexML v1.0 PRO",
+        "name": "ApexML v1.1 PRO",
         "short_name": "ApexML",
         "start_url": "/",
         "display": "standalone",
-        "background_color": "#06070c",
+        "background_color": "#05060b",
         "theme_color": "#6366f1",
         "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
     })
@@ -958,7 +960,7 @@ def api_sync_keys():
 
 
 # =============================================================================
-# CLEAN OBSIDIAN-GLASS UI — APEXML v1.0 PRO
+# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — APEXML v1.1 PRO
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -971,13 +973,14 @@ HTML_UI = """
   <link rel="icon" type="image/svg+xml" href="/icon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
-  <title>ApexML v1.0 PRO | AI Futures Terminal</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet" />
+  <title>ApexML v1.1 PRO | Institutional AI Futures Terminal</title>
   <style>
     :root {
-      --bg: #06070c;
-      --card: rgba(15, 18, 30, 0.78);
+      --bg: #05060b;
+      --card: rgba(13, 16, 28, 0.82);
       --border: rgba(255, 255, 255, 0.08);
+      --border-glow: rgba(99, 102, 241, 0.42);
       --accent: #6366f1;
       --cyan: #38bdf8;
       --green: #00f5a0;
@@ -989,69 +992,107 @@ HTML_UI = """
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, sans-serif; }
     body {
-      background: var(--bg);
+      background-color: var(--bg);
       background-image:
-        radial-gradient(ellipse 70% 45% at 20% -5%, rgba(99, 102, 241, 0.16), transparent 65%),
-        radial-gradient(ellipse 60% 40% at 85% 5%, rgba(0, 245, 160, 0.09), transparent 60%);
+        radial-gradient(ellipse 75% 45% at 15% -10%, rgba(99, 102, 241, 0.18), transparent 65%),
+        radial-gradient(ellipse 65% 40% at 88% 0%, rgba(0, 245, 160, 0.10), transparent 60%),
+        linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 36px 36px, 36px 36px;
       color: var(--text);
-      padding: 20px 16px 40px;
+      padding: 20px 16px 44px;
       min-height: 100vh;
       -webkit-font-smoothing: antialiased;
     }
-    .wrap { max-width: 1200px; margin: 0 auto; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
 
-    /* HEADER */
+    .wrap { max-width: 1240px; margin: 0 auto; }
+
+    /* HERO TOPBAR */
     .topbar {
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 14px;
-      background: var(--card); backdrop-filter: blur(20px); border: 1px solid var(--border);
-      border-radius: 18px; padding: 18px 22px; margin-bottom: 18px;
+      background: linear-gradient(135deg, rgba(19, 22, 42, 0.90), rgba(10, 12, 22, 0.94));
+      backdrop-filter: blur(22px);
+      border: 1px solid var(--border-glow);
+      border-radius: 20px;
+      padding: 20px 24px;
+      margin-bottom: 18px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255,255,255,0.08);
     }
-    .brand { display: flex; align-items: center; gap: 10px; font-size: 1.35rem; font-weight: 800; letter-spacing: -0.4px; }
+    .topbar-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 14px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 1.48rem; font-weight: 900; letter-spacing: -0.5px; }
     .tag {
       background: linear-gradient(135deg, var(--accent), var(--cyan));
-      color: #fff; font-size: 0.66rem; font-weight: 800; padding: 4px 10px; border-radius: 99px; letter-spacing: 0.6px;
+      color: #fff; font-size: 0.66rem; font-weight: 800; padding: 4px 11px; border-radius: 99px;
+      letter-spacing: 0.6px; text-transform: uppercase; box-shadow: 0 0 18px rgba(99, 102, 241, 0.4);
     }
-    .subtitle { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .subtitle { color: var(--muted); font-size: 0.79rem; margin-top: 5px; display: flex; align-items: center; gap: 6px; }
+    .pulse-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--green); box-shadow: 0 0 10px var(--green);
+      animation: pulse 1.8s infinite ease-in-out;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
 
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
     .btn {
-      cursor: pointer; border: none; border-radius: 10px; padding: 9px 14px;
-      font-weight: 700; font-size: 0.76rem; transition: all 0.15s ease;
-      display: inline-flex; align-items: center; gap: 6px;
+      cursor: pointer; border: none; border-radius: 11px; padding: 9px 14px;
+      font-weight: 800; font-size: 0.75rem; letter-spacing: 0.2px;
+      transition: all 0.15s ease; display: inline-flex; align-items: center; gap: 6px;
     }
     .btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
     .btn:active { transform: scale(0.97); }
-    .btn-primary { background: linear-gradient(135deg, var(--accent), #4f46e5); color: #fff; }
-    .btn-green { background: linear-gradient(135deg, var(--green), var(--cyan)); color: #041c15; }
-    .btn-amber { background: var(--amber); color: #1a1200; }
-    .btn-ghost { background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: var(--text); }
+    .btn-primary { background: linear-gradient(135deg, var(--accent), #4f46e5); color: #fff; box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3); }
+    .btn-green { background: linear-gradient(135deg, var(--green), var(--cyan)); color: #041c15; box-shadow: 0 4px 16px rgba(0, 245, 160, 0.25); }
+    .btn-amber { background: linear-gradient(135deg, #f59e0b, #fbbf24); color: #1a1200; }
+    .btn-ghost { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: var(--text); }
+    .btn-ghost:hover { border-color: var(--accent); background: rgba(99, 102, 241, 0.14); }
     .btn-danger { background: rgba(255, 59, 107, 0.15); border: 1px solid rgba(255, 59, 107, 0.4); color: #fda4af; }
 
     /* KPI GRID */
-    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin-bottom: 20px; }
     .card {
       background: var(--card); backdrop-filter: blur(18px); border: 1px solid var(--border);
-      border-radius: 16px; padding: 18px 20px;
+      border-radius: 16px; padding: 18px 20px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
     }
-    .kpi-lbl { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.7px; color: var(--muted); }
-    .kpi-val { font-family: var(--mono); font-size: 1.6rem; font-weight: 700; margin: 8px 0 4px; }
-    .kpi-sub { font-size: 0.76rem; color: var(--muted); }
+    .kpi-card { position: relative; overflow: hidden; }
+    .kpi-card::before {
+      content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent);
+    }
+    .kpi-card.glow-green::before { background: linear-gradient(90deg, transparent, var(--green), transparent); }
+    .kpi-card.glow-indigo::before { background: linear-gradient(90deg, transparent, var(--accent), transparent); }
+    .kpi-lbl { font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); }
+    .kpi-val { font-family: var(--mono); font-size: 1.65rem; font-weight: 800; margin: 8px 0 4px; letter-spacing: -0.5px; }
+    .kpi-sub { font-size: 0.75rem; color: var(--muted); }
 
     /* SIGNAL MATRIX */
     .sec-head {
-      display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;
-      font-size: 0.78rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.7px; color: #cbd5e1;
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+      margin-bottom: 14px; font-size: 0.76rem; font-weight: 800; text-transform: uppercase;
+      letter-spacing: 0.8px; color: #cbd5e1;
     }
-    .coin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-bottom: 18px; }
+    .coin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px; margin-bottom: 20px; }
     .coin-card {
-      background: rgba(12, 15, 26, 0.88); border: 1px solid var(--border); border-radius: 15px; padding: 16px;
+      background: linear-gradient(180deg, rgba(18, 22, 38, 0.92), rgba(10, 13, 24, 0.96));
+      border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px;
+      transition: border-color 0.2s ease, transform 0.15s ease;
     }
-    .coin-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-    .coin-name { font-size: 1.05rem; font-weight: 800; }
-    .pill { font-size: 0.68rem; font-weight: 800; padding: 4px 10px; border-radius: 99px; letter-spacing: 0.4px; }
-    .pill-long { background: rgba(0, 245, 160, 0.14); color: var(--green); border: 1px solid rgba(0, 245, 160, 0.4); }
-    .pill-short { background: rgba(255, 59, 107, 0.14); color: var(--red); border: 1px solid rgba(255, 59, 107, 0.4); }
+    .coin-card:hover { border-color: rgba(99, 102, 241, 0.45); transform: translateY(-2px); }
+    .coin-card.is-muted { opacity: 0.68; border-color: rgba(255, 59, 107, 0.22); }
+    .coin-card.is-muted:hover { opacity: 0.92; }
+
+    .coin-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; gap: 8px; }
+    .coin-name { font-size: 1.05rem; font-weight: 900; letter-spacing: -0.2px; }
+    .pill-row { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .pill { font-size: 0.65rem; font-weight: 800; padding: 3px 9px; border-radius: 99px; letter-spacing: 0.4px; text-transform: uppercase; }
+    .pill-long { background: rgba(0, 245, 160, 0.14); color: var(--green); border: 1px solid rgba(0, 245, 160, 0.45); }
+    .pill-short { background: rgba(255, 59, 107, 0.14); color: var(--red); border: 1px solid rgba(255, 59, 107, 0.45); }
     .pill-hold { background: rgba(255, 255, 255, 0.06); color: var(--muted); border: 1px solid var(--border); }
+    .pill-approved { background: rgba(56, 189, 248, 0.12); color: var(--cyan); border: 1px solid rgba(56, 189, 248, 0.4); }
+    .pill-muted { background: rgba(245, 158, 11, 0.14); color: var(--amber); border: 1px solid rgba(245, 158, 11, 0.45); }
 
     .prob-bar { display: flex; height: 8px; border-radius: 99px; overflow: hidden; background: rgba(255,255,255,0.06); margin: 8px 0; }
     .prob-l { background: var(--green); }
@@ -1061,45 +1102,62 @@ HTML_UI = """
 
     .bt-box {
       display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
-      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05);
-      border-radius: 10px; padding: 10px; text-align: center;
+      background: rgba(4, 6, 12, 0.65); border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 11px; padding: 10px; text-align: center;
     }
-    .bt-k { font-size: 0.64rem; color: var(--muted); text-transform: uppercase; font-weight: 700; }
-    .bt-v { font-family: var(--mono); font-size: 0.86rem; font-weight: 700; margin-top: 3px; }
+    .bt-k { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; font-weight: 800; letter-spacing: 0.4px; }
+    .bt-v { font-family: var(--mono); font-size: 0.88rem; font-weight: 800; margin-top: 3px; }
 
-    /* MAIN TWO-COLUMN LAYOUT */
+    /* TWO-COLUMN LAYOUT */
     .split { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; margin-bottom: 18px; }
-    @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+    @media (max-width: 920px) { .split { grid-template-columns: 1fr; } }
 
     .trade-row {
       background: rgba(255,255,255,0.03); border: 1px solid var(--border);
-      border-radius: 12px; padding: 14px; margin-bottom: 10px;
+      border-radius: 13px; padding: 14px; margin-bottom: 10px;
     }
-    .trade-meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; font-family: var(--mono); font-size: 0.75rem; margin: 10px 0; color: var(--muted); }
+    .trade-meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; font-family: var(--mono); font-size: 0.75rem; margin: 10px 0 0; color: var(--muted); }
     .trade-meta strong { color: var(--text); }
 
     .form-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
     .form-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
     label { display: block; font-size: 0.68rem; color: var(--muted); font-weight: 700; margin-bottom: 5px; }
     input {
-      width: 100%; background: rgba(5, 7, 13, 0.85); border: 1px solid var(--border);
+      width: 100%; background: rgba(5, 7, 13, 0.85); border: 1px solid rgba(255,255,255,0.1);
       color: var(--text); padding: 9px 11px; border-radius: 9px; font-family: var(--mono); font-size: 0.82rem;
     }
-    input:focus { outline: none; border-color: var(--accent); }
+    input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.16); }
 
     table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
     th, td { padding: 9px 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: var(--mono); }
-    th { font-family: 'Inter', sans-serif; color: var(--muted); font-size: 0.66rem; text-transform: uppercase; font-weight: 700; }
+    th { font-family: 'Inter', sans-serif; color: var(--muted); font-size: 0.65rem; text-transform: uppercase; font-weight: 800; }
 
     .logs {
-      background: rgba(4, 6, 11, 0.9); border: 1px solid var(--border); border-radius: 12px;
-      padding: 12px 14px; height: 180px; overflow-y: auto; font-family: var(--mono);
+      background: rgba(4, 6, 11, 0.92); border: 1px solid var(--border); border-radius: 12px;
+      padding: 12px 14px; height: 190px; overflow-y: auto; font-family: var(--mono);
       font-size: 0.72rem; color: #cbd5e1; line-height: 1.65;
     }
     .c-green { color: var(--green); }
     .c-red { color: var(--red); }
     .c-cyan { color: var(--cyan); }
     .c-amber { color: var(--amber); }
+
+    /* ABOUT & MANUAL MODAL */
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(3, 4, 9, 0.82);
+      backdrop-filter: blur(10px); z-index: 999; padding: 20px 14px; overflow-y: auto;
+    }
+    .modal-backdrop.open { display: flex; justify-content: center; align-items: flex-start; }
+    .modal-box {
+      background: linear-gradient(180deg, #101426, #090b14); border: 1px solid var(--border-glow);
+      border-radius: 20px; max-width: 820px; width: 100%; padding: 24px; margin: 20px auto;
+      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.8);
+    }
+    .manual-sec { margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.07); }
+    .manual-sec h3 { font-size: 0.92rem; color: var(--cyan); margin-bottom: 10px; letter-spacing: 0.2px; }
+    .manual-sec p, .manual-sec li { font-size: 0.83rem; color: #cbd5e1; line-height: 1.65; margin-bottom: 7px; }
+    .manual-sec ul { padding-left: 18px; }
+    .manual-sec strong { color: #fff; }
   </style>
 </head>
 <body>
@@ -1107,45 +1165,48 @@ HTML_UI = """
 
   <!-- TOP BAR -->
   <div class="topbar">
-    <div>
-      <div class="brand">🧠 APEXML <span class="tag">v1.0 PRO • 1H FUTURES</span></div>
-      <div class="subtitle" id="statusLine">Gradient Boosting • Walk-Forward Validated • 2:1 Risk Engine</div>
-    </div>
-    <div class="actions">
-      <button class="btn btn-green" onclick="installApp()">📲 Install App</button>
-      <button class="btn btn-amber" onclick="toggleMode()" id="modeBtn">Mode: PAPER</button>
-      <button class="btn btn-primary" onclick="retrainModels()" id="trainBtn">🧠 Retrain Brain</button>
-      <button class="btn btn-ghost" onclick="sweepNow()">⚡ Sweep</button>
+    <div class="topbar-row">
+      <div>
+        <div class="brand">🧠 APEXML <span class="tag">v1.1 PRO • QUALITY GATE</span></div>
+        <div class="subtitle"><span class="pulse-dot"></span><span id="statusLine">Gradient Boosting • Walk-Forward Quality Gate • 2:1 Risk Engine</span></div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-ghost" onclick="toggleManual(true)">📖 About & Manual</button>
+        <button class="btn btn-green" onclick="installApp()">📲 Install App</button>
+        <button class="btn btn-amber" onclick="toggleMode()" id="modeBtn">Mode: PAPER</button>
+        <button class="btn btn-primary" onclick="retrainModels()" id="trainBtn">🧠 Retrain Brain</button>
+        <button class="btn btn-ghost" onclick="sweepNow()">⚡ Sweep</button>
+      </div>
     </div>
   </div>
 
   <!-- 4 CLEAN KPI CARDS -->
   <div class="kpi-grid">
-    <div class="card">
+    <div class="card kpi-card glow-indigo">
       <div class="kpi-lbl">Available Balance</div>
       <div class="kpi-val c-cyan" id="balVal">$15.00</div>
       <div class="kpi-sub" id="balSub">Paper Mode • 2x Isolated</div>
     </div>
-    <div class="card">
+    <div class="card kpi-card glow-green">
       <div class="kpi-lbl">Verified Net PnL</div>
       <div class="kpi-val c-green" id="pnlVal">+$0.0000</div>
       <div class="kpi-sub">Trades: <strong id="tradeCount" style="color:#fff;">0</strong> | Win Rate: <strong id="liveWr" style="color:#fff;">0%</strong></div>
     </div>
-    <div class="card">
-      <div class="kpi-lbl">Unseen Backtest Avg</div>
+    <div class="card kpi-card">
+      <div class="kpi-lbl">Approved Models Avg</div>
       <div class="kpi-val" id="btAvgVal">--%</div>
-      <div class="kpi-sub">Last Trained: <span id="trainTime">--</span></div>
+      <div class="kpi-sub"><strong id="approvedCount" style="color:#fff;">0/6</strong> Approved • Trained <span id="trainTime">--</span></div>
     </div>
-    <div class="card">
+    <div class="card kpi-card">
       <div class="kpi-lbl">Circuit Breaker</div>
-      <div class="kpi-val c-green" id="cbVal">ARMED</div>
+      <div class="kpi-val c-green" id="cbVal">ACTIVE</div>
       <div class="kpi-sub" id="cbSub">0 / 2 consecutive losses</div>
     </div>
   </div>
 
   <!-- AI SIGNAL & WALK-FORWARD MATRIX -->
   <div class="sec-head">
-    <span>📡 Live ML Signal Matrix (1h Candles + BTC Macro Context)</span>
+    <span>📡 6-Coin Live ML Signal Matrix (Auto-Mutes Models ≤ 0% Unseen PnL)</span>
     <span style="color:var(--muted);font-weight:600;">Confidence Gate: ≥<span id="gateLbl">65</span>%</span>
   </div>
   <div class="coin-grid" id="coinGrid"></div>
@@ -1206,6 +1267,51 @@ HTML_UI = """
 
 </div>
 
+<!-- ABOUT & OPERATOR'S MANUAL MODAL -->
+<div class="modal-backdrop" id="manualModal" onclick="if(event.target.id==='manualModal') toggleManual(false)">
+  <div class="modal-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div class="brand" style="font-size:1.25rem;">📖 ApexML v1.1 PRO — Operator's Manual</div>
+      <button class="btn btn-danger" onclick="toggleManual(false)">✖ Close</button>
+    </div>
+
+    <div class="manual-sec">
+      <h3>1. How the AI Brain Works (Plain English)</h3>
+      <p>Every 6 hours, ApexML downloads the last <strong>900 1-hour candles (~37 days)</strong> from Gate.io Futures for 6 coins plus <strong>Bitcoin (BTC)</strong> macro trend data. It trains a <strong>Gradient Boosting Machine Learning model</strong> on 12 market features (momentum, EMA trend slopes, RSI, ATR volatility, volume spikes, candle body strength, and BTC gravity).</p>
+      <p>To prevent "cheating" (overfitting), it trains on the first <strong>75% of the history</strong> and tests itself on the most recent <strong>25% it has never seen</strong>. Only coins that make positive net profit on unseen data are marked <strong>✅ APPROVED</strong> to trade.</p>
+    </div>
+
+    <div class="manual-sec">
+      <h3>2. Understanding the Signal Matrix & Quality Gate</h3>
+      <ul>
+        <li><strong>✅ APPROVED vs. 🔇 MUTED:</strong> If a coin's <em>Unseen PnL</em> is above <strong>0%</strong>, it is <strong>APPROVED</strong> and allowed to open trades. If it is <strong>≤ 0%</strong>, the Quality Gate automatically <strong>MUTES</strong> it so the bot never wastes your money on a weak model.</li>
+        <li><strong>Probability Bar (LONG / HOLD / SHORT):</strong> Shows the model's exact confidence for the next 16 hours. The bot sits in 100% USDT cash until an APPROVED coin hits your <strong>Confidence Gate (default 65%)</strong>.</li>
+        <li><strong>2:1 Reward-to-Risk + 16h Time Exit:</strong> Every trade targets <strong>+4% Take Profit</strong> with a strict <strong>-2% Stop Loss</strong> (at 2x leverage, that's +8% win vs. -4% loss). If neither hits within 16 hours, the bot closes the trade automatically so your cash never gets stuck.</li>
+      </ul>
+    </div>
+
+    <div class="manual-sec">
+      <h3>3. Every Button & Setting Explained</h3>
+      <ul>
+        <li><strong>Mode (PAPER / LIVE):</strong> <em>PAPER</em> simulates trades with virtual USDT using real live Gate.io prices. Switch to <em>LIVE</em> only after connecting your Gate.io Perpetual Futures API keys.</li>
+        <li><strong>🧠 Retrain Brain:</strong> Immediately fetches fresh 1h candles, retrains all 6 ML models, and updates the APPROVED/MUTED badges.</li>
+        <li><strong>⚡ Sweep:</strong> Forces an instant price check on open trades and scans APPROVED coins for new entries.</li>
+        <li><strong>Slot ($) & Leverage (x):</strong> How much margin per trade (e.g., $10 at 2x controls a $20 Isolated Futures position). Isolated margin means a trade can never touch the rest of your wallet.</li>
+        <li><strong>Circuit Breaker (Max Loss Streak):</strong> If the bot hits <strong>2 stop-losses in a row</strong>, it automatically pauses new entries for 24 hours to protect your bankroll from choppy markets. You can unlock it manually anytime.</li>
+      </ul>
+    </div>
+
+    <div class="manual-sec">
+      <h3>4. Recommended Workflow for Beginners</h3>
+      <ul>
+        <li><strong>Step 1 (Days 1–5):</strong> Keep the bot in <strong>PAPER Mode</strong> with $15 virtual balance. Watch which coins stay <strong>APPROVED</strong> and check your <em>Verified Net PnL</em> and <em>Closed Trade History</em>.</li>
+        <li><strong>Step 2 (Going Live):</strong> Once you've seen the bot execute clean paper trades, create a Gate.io API key with <strong>Perpetual Futures (Read & Write)</strong> enabled, paste it in the bottom-right panel, and switch to <strong>LIVE</strong>.</li>
+        <li><strong>Step 3 (Bankroll Rule):</strong> Always keep a small buffer in your Futures wallet (e.g., $15 total with a $10 Slot size) so fees and funding never block an order.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
 <script>
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
@@ -1216,7 +1322,9 @@ HTML_UI = """
     if (deferredPrompt) { deferredPrompt.prompt(); deferredPrompt = null; }
     else alert("Tap your browser menu (⋮) and choose 'Add to Home screen' or 'Install app'.");
   }
-
+  function toggleManual(show) {
+    document.getElementById('manualModal').classList.toggle('open', show);
+  }
   function fmtPx(v) {
     v = Number(v || 0);
     if (v === 0) return '$0.0000';
@@ -1229,7 +1337,7 @@ HTML_UI = """
     const btn = document.getElementById('trainBtn');
     btn.innerText = '⏳ Training...';
     await fetch('/api/retrain', { method: 'POST' });
-    setTimeout(() => { btn.innerText = '🧠 Retrain Brain'; refresh(); }, 4000);
+    setTimeout(() => { btn.innerText = '🧠 Retrain Brain'; refresh(); }, 5000);
   }
   async function sweepNow() { await fetch('/api/sweep', { method: 'POST' }); await refresh(); }
   async function toggleMode() {
@@ -1261,7 +1369,7 @@ HTML_UI = """
         max_consecutive_losses: document.getElementById('cfgLoss').value
       })
     });
-    alert('Settings saved! Retraining models with your new TP/SL targets...');
+    alert('Settings saved! Retraining all 6 models with your new targets...');
     await refresh();
   }
   async function syncKeys() {
@@ -1327,7 +1435,6 @@ HTML_UI = """
       document.getElementById('tradeCount').innerText = trades;
       document.getElementById('liveWr').innerText = wr + '%';
 
-      // Circuit Breaker
       const locked = Number(s.now_ts || 0) < Number(s.circuit_breaker_until || 0);
       const cbEl = document.getElementById('cbVal');
       if (locked) {
@@ -1340,25 +1447,37 @@ HTML_UI = """
         document.getElementById('cbSub').innerText = `${s.consecutive_losses} / ${s.max_consecutive_losses} consecutive losses`;
       }
 
-      // Coin Signal Matrix
       const reps = Object.values(s.model_reports || {});
       if (reps.length > 0) {
-        const avgNet = reps.reduce((a, b) => a + Number(b.bt_net_pct || 0), 0) / reps.length;
+        const approved = reps.filter(c => !c.muted);
+        document.getElementById('approvedCount').innerText = `${approved.length}/${reps.length}`;
+        const avgNet = approved.length > 0
+          ? approved.reduce((a, b) => a + Number(b.bt_net_pct || 0), 0) / approved.length
+          : 0.0;
         const btEl = document.getElementById('btAvgVal');
         btEl.innerText = (avgNet >= 0 ? '+' : '') + avgNet.toFixed(1) + '%';
-        btEl.className = 'kpi-val ' + (avgNet >= 0 ? 'c-green' : 'c-red');
+        btEl.className = 'kpi-val ' + (avgNet > 0 ? 'c-green' : 'c-amber');
+
+        // Sort approved coins first, then by unseen PnL descending
+        reps.sort((a, b) => (a.muted - b.muted) || (b.bt_net_pct - a.bt_net_pct));
 
         document.getElementById('coinGrid').innerHTML = reps.map(c => {
           const pillCls = c.signal === 'LONG' ? 'pill-long' : (c.signal === 'SHORT' ? 'pill-short' : 'pill-hold');
-          const netCls = c.bt_net_pct >= 0 ? 'c-green' : 'c-red';
+          const netCls = c.bt_net_pct > 0 ? 'c-green' : 'c-red';
+          const gateBadge = c.muted
+            ? `<span class="pill pill-muted">🔇 Muted</span>`
+            : `<span class="pill pill-approved">✅ Approved</span>`;
           return `
-            <div class="coin-card">
+            <div class="coin-card ${c.muted ? 'is-muted' : ''}">
               <div class="coin-top">
                 <div>
                   <div class="coin-name">${c.pair}</div>
                   <div style="font-family:var(--mono);font-size:0.8rem;color:var(--muted);">${fmtPx(c.live_price)}</div>
                 </div>
-                <span class="pill ${pillCls}">${c.signal}</span>
+                <div class="pill-row">
+                  ${gateBadge}
+                  <span class="pill ${pillCls}">${c.signal}</span>
+                </div>
               </div>
               <div class="prob-bar">
                 <div class="prob-l" style="width:${c.prob_long}%"></div>
@@ -1379,14 +1498,13 @@ HTML_UI = """
           `;
         }).join('');
       } else {
-        document.getElementById('coinGrid').innerHTML = `<div class="card" style="grid-column:1/-1;text-align:center;color:var(--muted);">Training ML models on 900 hours of live Gate.io Futures candles... (takes ~8 seconds)</div>`;
+        document.getElementById('coinGrid').innerHTML = `<div class="card" style="grid-column:1/-1;text-align:center;color:var(--muted);">Training 6 ML models on 900 hours of live Gate.io Futures candles... (takes ~12 seconds)</div>`;
       }
 
-      // Active Trades
       const posList = Object.values(s.active_positions || {});
       document.getElementById('openCount').innerText = posList.length + ' Open';
       if (posList.length === 0) {
-        document.getElementById('activeTradesBox').innerHTML = `<div style="text-align:center;color:var(--muted);padding:36px 12px;font-size:0.84rem;">100% in USDT Cash — Waiting for a ≥${s.confidence_threshold}% ML signal on SUI, SOL, or ARB.</div>`;
+        document.getElementById('activeTradesBox').innerHTML = `<div style="text-align:center;color:var(--muted);padding:36px 12px;font-size:0.84rem;">100% in USDT Cash — Waiting for a ≥${s.confidence_threshold}% signal on an APPROVED coin.</div>`;
       } else {
         document.getElementById('activeTradesBox').innerHTML = posList.map(p => {
           const pnlCls = p.pnl_usdt >= 0 ? 'c-green' : 'c-red';
@@ -1414,7 +1532,6 @@ HTML_UI = """
         }).join('');
       }
 
-      // Trade History
       const hb = document.getElementById('histBody');
       if (s.trade_history && s.trade_history.length > 0) {
         hb.innerHTML = s.trade_history.map(t => `
