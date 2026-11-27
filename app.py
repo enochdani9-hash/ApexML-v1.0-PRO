@@ -2,9 +2,9 @@ import os
 import time
 import math
 import json
-import hmac 
-import hashlib 
-import threading 
+import hmac
+import hashlib
+import threading
 from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "indexvault_100_state.json"
+STATE_FILE = "indexvault_100_v2_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -36,27 +36,29 @@ PAIR_META_TS = 0.0
 
 DEFAULT_STATE = {
     "mode": "PAPER",
-    "auto_rebalance": True,         # Toggle: True = Auto-Rebalance Compounder, False = Pure Buy & Hold
-    "target_coin_count": 100,       # 100 coins in Paper Mode; auto-sized in Live Mode
-    "rebalance_trigger_pct": 25.0,  # Trim winner when it pumps +25% above its target weight
-    "live_min_order_usdt": 5.0,     # Safety floor per coin in Live Mode (respects Gate.io min_quote_amount)
-    "spot_fee_pct": 0.20,           # Gate.io Spot single-side fee
+    "auto_rebalance": True,
+    "target_coin_count": 100,
+    "rebalance_trigger_pct": 25.0,
+    "live_min_order_usdt": 5.0,
+    "spot_fee_pct": 0.20,
     "api_key": os.environ.get("GATE_API_KEY", "").strip(),
     "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
     "api_connected": False,
-    "api_status_msg": "Paper Mode Active — Deploy $50 or $100 Across Top 100 Coins",
+    "api_status_msg": "Paper Mode Active — Live 5s Price Feed & Top 100 Auto-Compounder",
     "live_spot_usdt": 0.0,
     "paper_cash_usdt": 100.0,
+    "harvested_usdt_vault": 0.0,    # Safely banked USDT from partial sells / profit harvests
     "total_deposited_usdt": 100.0,
-    "compound_pool_usdt": 0.0,      # Swept rebalance profits waiting to buy dips/new coins
-    "holdings": {},                 # { "BTC_USDT": { qty, avg_price, cost_usdt, last_price, value_usdt, pnl_pct, pnl_usdt, change_24h, rank, rebalances } }
-    "equity_history": [],           # [{ ts, date, time, equity, deposited, pnl_usdt, pnl_pct }]
+    "compound_pool_usdt": 0.0,
+    "holdings": {},
+    "equity_history": [],           # Live tick-by-tick equity points
     "daily_open_equity": 100.0,
     "daily_open_date": "",
     "rebalance_ledger": [],
     "stats": {
         "total_rebalances": 0,
-        "compounded_profit_usdt": 0.0
+        "compounded_profit_usdt": 0.0,
+        "total_harvests": 0
     },
     "logs": [],
     "cycle_count": 0,
@@ -107,8 +109,20 @@ def load_state():
                     STATE["api_key"] = sk
                 if ss:
                     STATE["api_secret"] = ss
+                STATE.setdefault("harvested_usdt_vault", 0.0)
+                STATE.setdefault("stats", {}).setdefault("total_harvests", 0)
         except Exception as e:
             add_log(f"State load notice: {e}")
+    else:
+        if os.path.exists("indexvault_100_state.json"):
+            try:
+                with open("indexvault_100_state.json", "r") as f:
+                    old_s = json.load(f)
+                    STATE.update(old_s)
+                    STATE.setdefault("harvested_usdt_vault", 0.0)
+                    STATE.setdefault("stats", {}).setdefault("total_harvests", 0)
+            except Exception:
+                pass
 
     ek = os.environ.get("GATE_API_KEY", "").strip()
     es = os.environ.get("GATE_API_SECRET", "").strip()
@@ -162,7 +176,7 @@ def refresh_pair_meta():
             continue
         if item.get("trade_status") != "tradable":
             continue
-        if item.get("st_tag"):  # Auto-Junk Filter: blocks delisting/risk-flagged tokens
+        if item.get("st_tag"):
             continue
         base = item.get("base", "").upper()
         if base in STABLECOINS or base.endswith(LEVERAGED_SUFFIXES):
@@ -188,7 +202,7 @@ def fetch_top_index_candidates(limit=120):
             continue
         last = float(t.get("last") or 0.0)
         qvol = float(t.get("quote_volume") or 0.0)
-        if last <= 0 or qvol < 150000:  # Minimum $150k 24h liquidity filter
+        if last <= 0 or qvol < 150000:
             continue
         ranked.append({
             "pair": cp,
@@ -271,9 +285,9 @@ def place_spot_market_sell(pair, coin_qty, prec=2):
 
 
 # =============================================================================
-# INDEX DEPLOYMENT & AUTO-REBALANCING COMPOUNDER
+# INDEX DEPLOYMENT & HARVEST-TO-USDT + REBUY ENGINE
 # =============================================================================
-def deploy_index_basket(deposit_usdt, target_count=100):
+def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
     candidates = fetch_top_index_candidates(limit=max(110, target_count + 10))
     if not candidates:
         raise ValueError("Could not fetch Gate.io Top 100 market list.")
@@ -291,6 +305,8 @@ def deploy_index_basket(deposit_usdt, target_count=100):
         selected = candidates[:target_count]
         per_coin = round(deposit_usdt / max(1, len(selected)), 4)
         with state_lock:
+            if replace_existing:
+                STATE["holdings"] = {}
             for c in selected:
                 pair = c["pair"]
                 px = c["last"]
@@ -327,7 +343,8 @@ def deploy_index_basket(deposit_usdt, target_count=100):
                 bought_count += 1
                 total_spent += per_coin
 
-            STATE["paper_cash_usdt"] = round(max(0.0, STATE.get("paper_cash_usdt", 0.0) - total_spent), 4)
+            if not replace_existing:
+                STATE["paper_cash_usdt"] = round(max(0.0, STATE.get("paper_cash_usdt", 0.0) - total_spent), 4)
             add_log(f"🚀 [PAPER INDEX] Deployed ${total_spent:.2f} across {bought_count} Top Gate.io tokens (${per_coin:.2f}/coin).")
             save_state()
     else:
@@ -338,7 +355,10 @@ def deploy_index_basket(deposit_usdt, target_count=100):
         if budget < live_floor:
             raise ValueError(f"Insufficient Gate.io Spot USDT (Available: ${avail_usdt:.2f})")
 
-        # Smart Auto-Sizing: buy as many Top-100 coins as budget allows while obeying Gate.io min_quote_amount
+        if replace_existing:
+            with state_lock:
+                STATE["holdings"] = {}
+
         remaining = budget
         for c in candidates[:target_count]:
             req_amt = max(live_floor, c["min_quote_amount"] * 1.05)
@@ -388,6 +408,72 @@ def deploy_index_basket(deposit_usdt, target_count=100):
     return bought_count, round(total_spent, 2)
 
 
+def execute_harvest_and_rebuy(sell_pct=None, profit_only=False):
+    with state_lock:
+        mode = STATE.get("mode", "PAPER")
+        holdings = STATE.get("holdings", {})
+        if not holdings:
+            raise ValueError("No active coins in your Index Basket to harvest.")
+        total_val = sum(float(h.get("value_usdt", 0.0)) for h in holdings.values())
+        deposited = float(STATE.get("total_deposited_usdt", 100.0))
+        fee_pct = float(STATE.get("spot_fee_pct", 0.20))
+        target_cnt = int(STATE.get("target_coin_count", 100))
+        has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
+
+    if total_val <= 1.0:
+        raise ValueError("Basket value is too small to harvest.")
+
+    if profit_only:
+        profit_avail = round(total_val - deposited, 4)
+        if profit_avail <= 0.10:
+            raise ValueError(f"Basket (${total_val:.2f}) has no net profit above your ${deposited:.2f} deposit yet.")
+        harvest_gross = profit_avail
+        actual_pct = round((harvest_gross / total_val) * 100.0, 2)
+    else:
+        actual_pct = max(1.0, min(95.0, float(sell_pct or 10.0)))
+        harvest_gross = round(total_val * (actual_pct / 100.0), 4)
+
+    reinvest_usdt = round(total_val - harvest_gross, 4)
+    if reinvest_usdt < 5.0:
+        raise ValueError("Remaining reinvest balance would be under $5.00. Lower your sell percentage.")
+
+    if mode == "LIVE":
+        if not has_keys:
+            raise ValueError("Connect Gate.io Spot API keys first for Live Harvest.")
+        # Sell current live holdings to USDT, keep harvested portion, re-deploy reinvest_usdt
+        with state_lock:
+            to_sell = list(STATE["holdings"].values())
+        for h in to_sell:
+            place_spot_market_sell(h["pair"], float(h["qty"]), int(h.get("amount_precision", 2)))
+            time.sleep(0.08)
+
+    harvest_net = round(harvest_gross * (1.0 - fee_pct / 100.0), 4)
+
+    # Immediately re-buy fresh Top N coins with the remaining balance
+    bought_cnt, spent = deploy_index_basket(reinvest_usdt, target_count=target_cnt, replace_existing=True)
+
+    with state_lock:
+        STATE["harvested_usdt_vault"] = round(STATE.get("harvested_usdt_vault", 0.0) + harvest_net, 4)
+        STATE["stats"]["total_harvests"] = int(STATE["stats"].get("total_harvests", 0)) + 1
+        STATE["rebalance_ledger"].insert(0, {
+            "time": datetime.utcnow().strftime("%H:%M:%S"),
+            "winner": f"HARVEST ({actual_pct:.1f}%)",
+            "trimmed": f"+${harvest_net:.2f} USDT",
+            "action": f"Locked in Vault & Re-Bought {bought_cnt} Coins (${spent:.2f})"
+        })
+        STATE["rebalance_ledger"] = STATE["rebalance_ledger"][:40]
+        add_log(
+            f"💰🔒 [HARVEST & REBUY] Sold {actual_pct:.1f}% (+${harvest_net:.2f} locked in USDT Vault) → "
+            f"Re-bought {bought_cnt} Top coins with ${spent:.2f}!"
+        )
+        save_state()
+
+    return harvest_net, bought_cnt, spent
+
+
+# =============================================================================
+# LIVE 5-SECOND TICKER & EQUITY CURVE ENGINE
+# =============================================================================
 def run_index_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
         return
@@ -439,7 +525,6 @@ def run_index_cycle(force_manual=False):
             # AUTO-REBALANCING COMPOUNDER
             if auto_reb and len(holdings) >= 2 and total_holdings_val > 0:
                 target_weight_val = total_holdings_val / len(holdings)
-                # Find any winner that surged >= reb_trigger % above target weight
                 winners = [
                     h for h in holdings.values()
                     if h["value_usdt"] >= target_weight_val * (1.0 + reb_trigger / 100.0)
@@ -450,7 +535,6 @@ def run_index_cycle(force_manual=False):
                     trim_usdt = round(w["value_usdt"] - target_weight_val, 4)
                     if trim_usdt < 0.05:
                         continue
-                    # In LIVE mode, respect Gate.io minimum order size
                     if mode == "LIVE" and trim_usdt < max(live_floor, float(w.get("min_quote_amount", 3.0))):
                         continue
 
@@ -465,7 +549,6 @@ def run_index_cycle(force_manual=False):
                     w["value_usdt"] = round(w["qty"] * float(w["last_price"]), 4)
                     w["rebalances"] = int(w.get("rebalances", 0)) + 1
 
-                    # Reinvest into the deepest laggard
                     target_lag = laggards[0] if laggards and laggards[0]["pair"] != w["pair"] else None
                     reinvest_note = "Swept to Compound Pool"
                     if target_lag and (mode == "PAPER" or net_trimmed >= max(live_floor, float(target_lag.get("min_quote_amount", 3.0)))):
@@ -498,10 +581,11 @@ def run_index_cycle(force_manual=False):
                     STATE["rebalance_ledger"] = STATE["rebalance_ledger"][:40]
                     add_log(f"♻️ [COMPOUND] Trimmed +${net_trimmed:.2f} from {w['pair']} (+{w['pnl_pct']}%) → {reinvest_note}")
 
-            # DAILY SNAPSHOT & EQUITY CURVE RECORDING
+            # REAL-TIME EQUITY CURVE (RECORDS ON EVERY PRICE CHANGE!)
             cash_val = float(STATE.get("live_spot_usdt", 0.0)) if mode == "LIVE" else float(STATE.get("paper_cash_usdt", 0.0))
             pool_val = float(STATE.get("compound_pool_usdt", 0.0))
-            total_equity = round(total_holdings_val + cash_val + pool_val, 4)
+            vault_val = float(STATE.get("harvested_usdt_vault", 0.0))
+            total_equity = round(total_holdings_val + cash_val + pool_val + vault_val, 4)
             deposited = max(0.01, float(STATE.get("total_deposited_usdt", 100.0)))
             total_pnl = round(total_equity - deposited, 4)
             total_pnl_pct = round((total_pnl / deposited) * 100.0, 2)
@@ -513,17 +597,18 @@ def run_index_cycle(force_manual=False):
 
             now_ts = time.time()
             hist = STATE.get("equity_history", [])
-            if not hist or (now_ts - float(hist[-1].get("ts", 0.0)) >= 900) or hist[-1].get("date") != today_str:
+            last_eq = float(hist[-1]["equity"]) if hist else -1.0
+            if not hist or abs(total_equity - last_eq) >= 0.0005 or (now_ts - float(hist[-1].get("ts", 0.0)) >= 10.0):
                 hist.append({
                     "ts": now_ts,
                     "date": today_str,
-                    "time": datetime.utcnow().strftime("%H:%M"),
+                    "time": datetime.utcnow().strftime("%H:%M:%S"),
                     "equity": total_equity,
                     "deposited": deposited,
                     "pnl_usdt": total_pnl,
                     "pnl_pct": total_pnl_pct
                 })
-                STATE["equity_history"] = hist[-96:]  # Keeps rolling equity curve points
+                STATE["equity_history"] = hist[-180:]  # Smooth rolling live curve
 
             STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
             STATE["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
@@ -535,16 +620,16 @@ def run_index_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("🏛️ IndexVault 100 PRO Online — Crypto S&P 500 Auto-Compounding Engine Ready.")
+    add_log("🏛️ IndexVault 100 v2.0 PRO Online — Live 5s Equity Curve + Harvest & Rebuy Engine Ready.")
     while True:
         run_index_cycle(force_manual=False)
-        time.sleep(15.0)
+        time.sleep(5.0)
 
 
 def ensure_worker_alive():
     global worker_started
     now = time.time()
-    if not worker_started or (now - STATE.get("last_worker_heartbeat", 0) > 45):
+    if not worker_started or (now - STATE.get("last_worker_heartbeat", 0) > 25):
         worker_started = True
         STATE["last_worker_heartbeat"] = now
         threading.Thread(target=background_worker, daemon=True).start()
@@ -561,7 +646,7 @@ def check_worker():
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
-        "name": "IndexVault 100 PRO",
+        "name": "IndexVault 100 v2.0 PRO",
         "short_name": "IndexVault",
         "start_url": "/",
         "display": "standalone",
@@ -606,7 +691,6 @@ def api_deploy_index():
     cnt = max(5, min(120, int(float(d.get("coin_count") or 100))))
     with state_lock:
         if STATE.get("mode") == "PAPER":
-            # If starting fresh or adding cash, ensure paper cash covers deployment
             if len(STATE.get("holdings", {})) == 0:
                 STATE["paper_cash_usdt"] = amt
                 STATE["total_deposited_usdt"] = amt
@@ -621,9 +705,22 @@ def api_deploy_index():
         save_state()
 
     try:
-        bought, spent = deploy_index_basket(amt, cnt)
+        bought, spent = deploy_index_basket(amt, cnt, replace_existing=False)
         run_index_cycle(force_manual=True)
         return jsonify({"ok": True, "bought": bought, "spent": spent})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/harvest_and_rebuy", methods=["POST"])
+def api_harvest_and_rebuy():
+    d = request.json or {}
+    profit_only = bool(d.get("profit_only", False))
+    sell_pct = d.get("sell_pct", 10.0)
+    try:
+        harvested, bought_cnt, spent = execute_harvest_and_rebuy(sell_pct=sell_pct, profit_only=profit_only)
+        run_index_cycle(force_manual=True)
+        return jsonify({"ok": True, "harvested": harvested, "bought": bought_cnt, "spent": spent})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
@@ -670,12 +767,13 @@ def api_reset_paper():
     with state_lock:
         STATE["holdings"] = {}
         STATE["paper_cash_usdt"] = amt
+        STATE["harvested_usdt_vault"] = 0.0
         STATE["total_deposited_usdt"] = amt
         STATE["compound_pool_usdt"] = 0.0
         STATE["daily_open_equity"] = amt
         STATE["equity_history"] = []
         STATE["rebalance_ledger"] = []
-        STATE["stats"] = {"total_rebalances": 0, "compounded_profit_usdt": 0.0}
+        STATE["stats"] = {"total_rebalances": 0, "compounded_profit_usdt": 0.0, "total_harvests": 0}
         add_log(f"🧹 IndexVault Paper Portfolio reset to ${amt:.2f} USDT.")
         save_state()
     return jsonify({"ok": True})
@@ -714,7 +812,7 @@ def api_sync_keys():
 
 
 # =============================================================================
-# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — INDEXVAULT 100 PRO
+# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — INDEXVAULT 100 v2.0 PRO
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -728,11 +826,11 @@ HTML_UI = """
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet" />
-  <title>IndexVault 100 PRO | Crypto S&P 500 Compounder</title>
+  <title>IndexVault 100 v2.0 PRO | Live Crypto S&P 500</title>
   <style>
     :root {
       --bg: #04060a;
-      --card: rgba(13, 17, 28, 0.84);
+      --card: rgba(13, 17, 28, 0.86);
       --border: rgba(255, 255, 255, 0.08);
       --gold: #f59e0b;
       --gold-soft: rgba(245, 158, 11, 0.14);
@@ -748,8 +846,8 @@ HTML_UI = """
     body {
       background-color: var(--bg);
       background-image:
-        radial-gradient(ellipse 75% 45% at 15% -10%, rgba(245, 158, 11, 0.16), transparent 65%),
-        radial-gradient(ellipse 65% 40% at 88% 0%, rgba(0, 245, 160, 0.11), transparent 60%),
+        radial-gradient(ellipse 75% 45% at 15% -10%, rgba(245, 158, 11, 0.17), transparent 65%),
+        radial-gradient(ellipse 65% 40% at 88% 0%, rgba(0, 245, 160, 0.12), transparent 60%),
         linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
         linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
       background-size: 100% 100%, 100% 100%, 36px 36px, 36px 36px;
@@ -763,19 +861,19 @@ HTML_UI = """
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; }
     ::-webkit-scrollbar-thumb:hover { background: var(--gold); }
 
-    .wrap { max-width: 1260px; margin: 0 auto; }
+    .wrap { max-width: 1280px; margin: 0 auto; }
 
     .topbar {
-      background: linear-gradient(135deg, rgba(24, 20, 14, 0.90), rgba(10, 13, 22, 0.95));
+      background: linear-gradient(135deg, rgba(26, 21, 14, 0.92), rgba(10, 13, 22, 0.96));
       backdrop-filter: blur(22px);
-      border: 1px solid rgba(245, 158, 11, 0.38);
+      border: 1px solid rgba(245, 158, 11, 0.42);
       border-radius: 20px;
       padding: 20px 24px;
       margin-bottom: 18px;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255,255,255,0.08);
     }
     .topbar-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 14px; }
-    .brand { display: flex; align-items: center; gap: 10px; font-size: 1.5rem; font-weight: 900; letter-spacing: -0.5px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 1.52rem; font-weight: 900; letter-spacing: -0.5px; }
     .tag {
       background: linear-gradient(135deg, var(--gold), #fbbf24);
       color: #1a1000; font-size: 0.66rem; font-weight: 900; padding: 4px 11px; border-radius: 99px;
@@ -785,9 +883,9 @@ HTML_UI = """
     .pulse-dot {
       display: inline-block; width: 8px; height: 8px; border-radius: 50%;
       background: var(--green); box-shadow: 0 0 10px var(--green);
-      animation: pulse 1.8s infinite ease-in-out;
+      animation: pulse 1.6s infinite ease-in-out;
     }
-    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.8); } }
 
     .actions { display: flex; flex-wrap: wrap; gap: 8px; }
     .btn {
@@ -814,11 +912,12 @@ HTML_UI = """
     }
     .kpi-card.glow-gold::before { background: linear-gradient(90deg, transparent, var(--gold), transparent); }
     .kpi-card.glow-green::before { background: linear-gradient(90deg, transparent, var(--green), transparent); }
+    .kpi-card.glow-cyan::before { background: linear-gradient(90deg, transparent, var(--cyan), transparent); }
     .kpi-lbl { font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); }
     .kpi-val { font-family: var(--mono); font-size: 1.65rem; font-weight: 800; margin: 8px 0 4px; letter-spacing: -0.5px; }
     .kpi-sub { font-size: 0.75rem; color: var(--muted); }
 
-    .split { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; margin-bottom: 18px; }
+    .split { display: grid; grid-template-columns: 1.32fr 1fr; gap: 16px; margin-bottom: 18px; }
     @media (max-width: 960px) { .split { grid-template-columns: 1fr; } }
 
     .sec-head {
@@ -827,12 +926,34 @@ HTML_UI = """
       letter-spacing: 0.8px; color: #cbd5e1;
     }
 
-    /* CHART BOX */
+    /* LIVE CHART BOX */
     .chart-wrap {
-      background: rgba(4, 6, 12, 0.72); border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 14px; padding: 14px; height: 210px; position: relative;
+      background: rgba(4, 6, 12, 0.78); border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 14px; padding: 14px 16px; height: 235px; position: relative;
     }
     svg.eq-svg { width: 100%; height: 100%; overflow: visible; }
+    .chart-badge {
+      position: absolute; top: 10px; left: 14px; font-family: var(--mono); font-size: 0.72rem;
+      background: rgba(13, 17, 28, 0.85); border: 1px solid rgba(255,255,255,0.1);
+      padding: 4px 10px; border-radius: 99px; color: var(--muted);
+    }
+
+    /* HARVEST PANEL */
+    .harvest-box {
+      background: linear-gradient(135deg, rgba(0, 245, 160, 0.07), rgba(56, 189, 248, 0.05));
+      border: 1px solid rgba(0, 245, 160, 0.30); border-radius: 14px; padding: 14px; margin-bottom: 14px;
+    }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .chip {
+      background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12);
+      color: #cbd5e1; font-size: 0.7rem; font-weight: 800; padding: 5px 11px; border-radius: 99px; cursor: pointer;
+    }
+    .chip:hover { border-color: var(--green); color: #fff; background: var(--green-soft); }
+    .preview-strip {
+      font-family: var(--mono); font-size: 0.72rem; color: var(--muted);
+      background: rgba(4, 6, 12, 0.65); border-radius: 9px; padding: 8px 10px; margin-bottom: 10px;
+      display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px;
+    }
 
     /* MOVERS */
     .movers-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
@@ -874,8 +995,8 @@ HTML_UI = """
   <div class="topbar">
     <div class="topbar-row">
       <div>
-        <div class="brand">🏛️ INDEXVAULT 100 <span class="tag">PRO • CRYPTO S&P 500</span></div>
-        <div class="subtitle"><span class="pulse-dot"></span><span id="statusLine">Auto-Rebalancing 100-Coin Index • Auto-Junk Filtered</span></div>
+        <div class="brand">🏛️ INDEXVAULT 100 <span class="tag">v2.0 PRO • LIVE TICKER</span></div>
+        <div class="subtitle"><span class="pulse-dot"></span><span id="statusLine">Live 5s Equity Curve • Harvest % to USDT & Rebuy Top 100</span></div>
       </div>
       <div class="actions">
         <button class="btn btn-green" onclick="installApp()">📲 Install App</button>
@@ -891,34 +1012,34 @@ HTML_UI = """
     <div class="card kpi-card glow-gold">
       <div class="kpi-lbl">Total Index Net Worth</div>
       <div class="kpi-val c-gold" id="netWorthVal">$100.00</div>
-      <div class="kpi-sub">Deposited: <strong id="depVal" style="color:#fff;">$100.00</strong> • Coins: <strong id="coinCnt" style="color:#fff;">0</strong></div>
+      <div class="kpi-sub">Basket: <strong id="basketVal" style="color:#fff;">$0.00</strong> • Coins: <strong id="coinCnt" style="color:#fff;">0</strong></div>
     </div>
     <div class="card kpi-card glow-green">
       <div class="kpi-lbl">All-Time Growth / Profit</div>
       <div class="kpi-val c-green" id="allPnlVal">+$0.00</div>
-      <div class="kpi-sub" id="allPnlPct">+0.00% Total Return</div>
+      <div class="kpi-sub" id="allPnlPct">+0.00% Total Return (Dep: $100)</div>
     </div>
-    <div class="card kpi-card">
+    <div class="card kpi-card glow-cyan">
       <div class="kpi-lbl">Today's Daily Growth</div>
       <div class="kpi-val c-cyan" id="dailyVal">+$0.00</div>
       <div class="kpi-sub" id="dailyPct">+0.00% Since Daily Open</div>
     </div>
-    <div class="card kpi-card">
-      <div class="kpi-lbl">Compounded Rebalances</div>
-      <div class="kpi-val c-green" id="rebTotalVal">$0.00</div>
-      <div class="kpi-sub">Trims: <strong id="rebCnt" style="color:#fff;">0</strong> • Pool: <strong id="poolVal" style="color:#fff;">$0.00</strong></div>
+    <div class="card kpi-card glow-green">
+      <div class="kpi-lbl">🔒 Locked USDT Vault</div>
+      <div class="kpi-val c-green" id="vaultVal">$0.00</div>
+      <div class="kpi-sub">Harvests: <strong id="harvCnt" style="color:#fff;">0</strong> • Rebalances: <strong id="rebCnt" style="color:#fff;">0</strong></div>
     </div>
   </div>
 
-  <!-- EQUITY CURVE & DEPLOY COMMAND DECK -->
+  <!-- LIVE EQUITY CURVE & HARVEST / DEPLOY DECK -->
   <div class="split">
     <div class="card">
       <div class="sec-head">
-        <span>📈 Daily Money Growth & Equity Curve</span>
-        <span id="lastUpd" style="font-family:var(--mono);color:var(--muted);">--:--:--</span>
+        <span>📈 Live Moving Equity Curve (Updates Every Price Tick)</span>
+        <span id="lastUpd" style="font-family:var(--mono);color:var(--green);">--:--:--</span>
       </div>
       <div class="chart-wrap" id="chartWrap">
-        <div style="text-align:center;color:var(--muted);padding-top:75px;font-size:0.82rem;">Deploy your basket on the right to start tracking your live Daily Equity Curve.</div>
+        <div style="text-align:center;color:var(--muted);padding-top:85px;font-size:0.82rem;">Deploy your basket on the right to watch your live Equity Curve move tick-by-tick.</div>
       </div>
       <div class="movers-grid">
         <div class="mover-box">
@@ -933,24 +1054,43 @@ HTML_UI = """
     </div>
 
     <div class="card">
+      <!-- HARVEST % TO USDT & REBUY ALL 100 COINS -->
+      <div class="harvest-box">
+        <div class="sec-head" style="margin-bottom:8px;color:var(--green);"><span>💰 Harvest % to USDT & Rebuy All 100 Coins</span></div>
+        <div class="chip-row">
+          <span class="chip" onclick="setHarvestPct(5)">5%</span>
+          <span class="chip" onclick="setHarvestPct(10)">10%</span>
+          <span class="chip" onclick="setHarvestPct(25)">25%</span>
+          <span class="chip" onclick="setHarvestPct(50)">50%</span>
+          <span class="chip" style="border-color:var(--gold);color:var(--gold);" onclick="harvestProfitOnly()">✨ Profit Only</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:8px;">
+          <input type="number" id="harvPctInput" value="10" min="1" max="95" step="1" oninput="updateHarvestPreview()" placeholder="Sell %" />
+          <button class="btn btn-green" onclick="runHarvest()" id="harvBtn">🔒 Sell % & Rebuy 100</button>
+        </div>
+        <div class="preview-strip">
+          <span>Lock to USDT: <strong class="c-green" id="prevLock">$0.00</strong></span>
+          <span>Rebuy 100 Coins: <strong class="c-gold" id="prevRebuy">$0.00</strong></span>
+        </div>
+      </div>
+
+      <!-- LAUNCH / ADD CASH -->
       <div class="sec-head"><span>🚀 Launch / Add Cash to Index Basket</span></div>
       <div class="form-grid-2">
         <div><label>Deposit Amount (USDT)</label><input type="number" id="depInput" value="100" step="10" /></div>
         <div><label>Target Coins (Max 100)</label><input type="number" id="cntInput" value="100" min="5" max="120" /></div>
       </div>
-      <button class="btn btn-gold" style="width:100%;justify-content:center;padding:12px;margin-bottom:14px;" onclick="deployIndex()" id="deployBtn">🏛️ Buy Top 100 Index Basket Now</button>
+      <button class="btn btn-gold" style="width:100%;justify-content:center;padding:11px;margin-bottom:14px;" onclick="deployIndex()" id="deployBtn">🏛️ Buy Top 100 Index Basket Now</button>
 
-      <div class="sec-head"><span>⚙️ Compounding & Live Rules</span></div>
+      <div class="sec-head"><span>⚙️ Rules & Gate.io Spot API</span></div>
       <div class="form-grid-2">
         <div><label>Rebalance Trim (+%)</label><input type="number" id="cfgTrig" value="25" step="5" /></div>
         <div><label>Live Min / Coin ($)</label><input type="number" id="cfgMin" value="5" step="1" /></div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:14px;">
+      <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:12px;">
         <button class="btn btn-ghost" style="justify-content:center;" onclick="saveConfig()">💾 Save Rules</button>
         <button class="btn btn-ghost" onclick="resetPaper()">🧹 Reset Paper</button>
       </div>
-
-      <div class="sec-head"><span>🔑 Gate.io Spot API Keys (Optional Live)</span></div>
       <div class="form-grid-2">
         <input type="password" id="apiKey" placeholder="Gate.io Spot API Key" autocomplete="off" />
         <input type="password" id="apiSec" placeholder="Gate.io Spot Secret" autocomplete="off" />
@@ -984,19 +1124,19 @@ HTML_UI = """
     </div>
   </div>
 
-  <!-- REBALANCE LEDGER & TELEMETRY -->
+  <!-- HARVEST / REBALANCE LEDGER & TELEMETRY -->
   <div class="split">
     <div class="card">
-      <div class="sec-head"><span>♻️ Auto-Rebalance Compounding Ledger</span></div>
+      <div class="sec-head"><span>♻️ Harvest & Auto-Rebalance Ledger</span></div>
       <div style="max-height:185px;overflow-y:auto;">
         <table>
-          <thead><tr><th>Time</th><th>Winner Trimmed</th><th>Amount</th><th>Reinvested Into</th></tr></thead>
+          <thead><tr><th>Time</th><th>Event</th><th>Amount</th><th>Result</th></tr></thead>
           <tbody id="rebBody"></tbody>
         </table>
       </div>
     </div>
     <div class="card">
-      <div class="sec-head"><span>🖥️ IndexVault Telemetry</span></div>
+      <div class="sec-head"><span>🖥️ IndexVault Live Telemetry</span></div>
       <div class="logs" id="logBox"></div>
     </div>
   </div>
@@ -1021,6 +1161,50 @@ HTML_UI = """
     if (v < 0.01) return '$' + v.toFixed(6);
     if (v < 1) return '$' + v.toFixed(4);
     return '$' + v.toFixed(2);
+  }
+
+  let currentBasketVal = 0;
+  function setHarvestPct(p) {
+    document.getElementById('harvPctInput').value = p;
+    updateHarvestPreview();
+  }
+  function updateHarvestPreview() {
+    const pct = Math.max(0, Math.min(95, Number(document.getElementById('harvPctInput').value || 0)));
+    const lockAmt = currentBasketVal * (pct / 100);
+    const rebuyAmt = Math.max(0, currentBasketVal - lockAmt);
+    document.getElementById('prevLock').innerText = '$' + lockAmt.toFixed(2);
+    document.getElementById('prevRebuy').innerText = '$' + rebuyAmt.toFixed(2);
+  }
+
+  async function runHarvest() {
+    const pct = Number(document.getElementById('harvPctInput').value || 10);
+    const btn = document.getElementById('harvBtn');
+    btn.innerText = '⏳ Harvesting...';
+    const r = await fetch('/api/harvest_and_rebuy', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ sell_pct: pct, profit_only: false })
+    });
+    const d = await r.json();
+    if (d.ok) alert(`Locked +$${d.harvested} USDT in your Vault & re-bought ${d.bought} Top coins with $${d.spent}!`);
+    else alert('Notice: ' + (d.error || 'Could not harvest'));
+    btn.innerText = '🔒 Sell % & Rebuy 100';
+    await refresh();
+  }
+
+  async function harvestProfitOnly() {
+    const btn = document.getElementById('harvBtn');
+    btn.innerText = '⏳ Harvesting...';
+    const r = await fetch('/api/harvest_and_rebuy', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ profit_only: true })
+    });
+    const d = await r.json();
+    if (d.ok) alert(`Harvested +$${d.harvested} pure profit to USDT Vault & re-bought ${d.bought} Top coins!`);
+    else alert('Notice: ' + (d.error || 'No net profit to harvest yet'));
+    btn.innerText = '🔒 Sell % & Rebuy 100';
+    await refresh();
   }
 
   async function deployIndex() {
@@ -1094,31 +1278,45 @@ HTML_UI = """
     if (!hist || hist.length === 0) return;
     const pts = hist.length === 1 ? [hist[0], hist[0]] : hist;
     const vals = pts.map(p => Number(p.equity));
-    const minV = Math.min(...vals) * 0.998;
-    const maxV = Math.max(...vals) * 1.002;
+    const rawMin = Math.min(...vals);
+    const rawMax = Math.max(...vals);
+    const pad = Math.max(0.05, (rawMax - rawMin) * 0.15);
+    const minV = rawMin - pad;
+    const maxV = rawMax + pad;
     const span = Math.max(0.01, maxV - minV);
-    const w = 600, h = 175;
+
+    const w = 620, h = 190;
     const coords = pts.map((p, idx) => {
-      const x = (idx / (pts.length - 1)) * w;
-      const y = h - ((Number(p.equity) - minV) / span) * (h - 20) - 10;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
+      const x = (idx / (pts.length - 1)) * (w - 14) + 4;
+      const y = h - ((Number(p.equity) - minV) / span) * (h - 28) - 14;
+      return { x, y };
     });
-    const linePts = coords.join(' ');
-    const areaPts = `0,${h} ${linePts} ${w},${h}`;
+    const linePts = coords.map(c => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
+    const lastPt = coords[coords.length - 1];
+    const areaPts = `4,${h} ${linePts} ${lastPt.x.toFixed(1)},${h}`;
     const lastEq = vals[vals.length - 1];
     const firstEq = vals[0];
     const strokeCol = lastEq >= firstEq ? '#00f5a0' : '#ff3b6b';
 
     wrap.innerHTML = `
+      <div class="chart-badge">LIVE: <strong style="color:${strokeCol}">$${lastEq.toFixed(4)}</strong> • High $${rawMax.toFixed(2)} / Low $${rawMin.toFixed(2)}</div>
       <svg class="eq-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
         <defs>
           <linearGradient id="eqGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="${strokeCol}" stop-opacity="0.32" />
+            <stop offset="0%" stop-color="${strokeCol}" stop-opacity="0.34" />
             <stop offset="100%" stop-color="${strokeCol}" stop-opacity="0.0" />
           </linearGradient>
         </defs>
+        <line x1="0" y1="${(h*0.25).toFixed(0)}" x2="${w}" y2="${(h*0.25).toFixed(0)}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4 4" />
+        <line x1="0" y1="${(h*0.50).toFixed(0)}" x2="${w}" y2="${(h*0.50).toFixed(0)}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4 4" />
+        <line x1="0" y1="${(h*0.75).toFixed(0)}" x2="${w}" y2="${(h*0.75).toFixed(0)}" stroke="rgba(255,255,255,0.05)" stroke-dasharray="4 4" />
         <polygon points="${areaPts}" fill="url(#eqGrad)" />
-        <polyline points="${linePts}" fill="none" stroke="${strokeCol}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+        <polyline points="${linePts}" fill="none" stroke="${strokeCol}" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" />
+        <circle cx="${lastPt.x.toFixed(1)}" cy="${lastPt.y.toFixed(1)}" r="5" fill="${strokeCol}" />
+        <circle cx="${lastPt.x.toFixed(1)}" cy="${lastPt.y.toFixed(1)}" r="10" fill="${strokeCol}" opacity="0.28">
+          <animate attributeName="r" values="5;13;5" dur="1.6s" repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0.45;0.05;0.45" dur="1.6s" repeatCount="indefinite" />
+        </circle>
       </svg>
     `;
   }
@@ -1159,7 +1357,7 @@ HTML_UI = """
       }
 
       document.getElementById('statusLine').innerText = s.api_status_msg;
-      document.getElementById('lastUpd').innerText = s.last_update;
+      document.getElementById('lastUpd').innerText = 'LIVE ' + s.last_update;
 
       const isLive = s.mode === 'LIVE';
       const modeBtn = document.getElementById('modeBtn');
@@ -1170,9 +1368,13 @@ HTML_UI = """
 
       latestHoldings = Object.values(s.holdings || {}).sort((a, b) => (a.rank || 999) - (b.rank || 999));
       const holdVal = latestHoldings.reduce((acc, h) => acc + Number(h.value_usdt || 0), 0);
+      currentBasketVal = holdVal;
+      updateHarvestPreview();
+
       const cashVal = isLive ? Number(s.live_spot_usdt || 0) : Number(s.paper_cash_usdt || 0);
       const poolVal = Number(s.compound_pool_usdt || 0);
-      const netWorth = holdVal + cashVal + poolVal;
+      const vaultVal = Number(s.harvested_usdt_vault || 0);
+      const netWorth = holdVal + cashVal + poolVal + vaultVal;
       const dep = Math.max(0.01, Number(s.total_deposited_usdt || 100));
       const allPnl = netWorth - dep;
       const allPct = (allPnl / dep) * 100;
@@ -1182,22 +1384,22 @@ HTML_UI = """
       const dailyPct = (dailyDiff / dailyOpen) * 100;
 
       document.getElementById('netWorthVal').innerText = '$' + netWorth.toFixed(2);
-      document.getElementById('depVal').innerText = '$' + dep.toFixed(2);
+      document.getElementById('basketVal').innerText = '$' + holdVal.toFixed(2);
       document.getElementById('coinCnt').innerText = latestHoldings.length;
 
       const allEl = document.getElementById('allPnlVal');
       allEl.innerText = (allPnl >= 0 ? '+$' : '-$') + Math.abs(allPnl).toFixed(2);
       allEl.className = 'kpi-val ' + (allPnl >= 0 ? 'c-green' : 'c-red');
-      document.getElementById('allPnlPct').innerText = `${allPct >= 0 ? '+' : ''}${allPct.toFixed(2)}% Total Return`;
+      document.getElementById('allPnlPct').innerText = `${allPct >= 0 ? '+' : ''}${allPct.toFixed(2)}% Total Return (Dep: $${dep.toFixed(0)})`;
 
       const dEl = document.getElementById('dailyVal');
       dEl.innerText = (dailyDiff >= 0 ? '+$' : '-$') + Math.abs(dailyDiff).toFixed(2);
       dEl.className = 'kpi-val ' + (dailyDiff >= 0 ? 'c-green' : 'c-red');
       document.getElementById('dailyPct').innerText = `${dailyPct >= 0 ? '+' : ''}${dailyPct.toFixed(2)}% Since Daily Open`;
 
-      document.getElementById('rebTotalVal').innerText = '$' + Number(s.stats.compounded_profit_usdt || 0).toFixed(2);
+      document.getElementById('vaultVal').innerText = '$' + vaultVal.toFixed(2);
+      document.getElementById('harvCnt').innerText = s.stats.total_harvests || 0;
       document.getElementById('rebCnt').innerText = s.stats.total_rebalances || 0;
-      document.getElementById('poolVal').innerText = '$' + poolVal.toFixed(2);
 
       renderChart(s.equity_history || []);
       renderHoldings();
@@ -1218,14 +1420,14 @@ HTML_UI = """
           <tr><td>${r.time}</td><td><strong>${r.winner}</strong></td><td class="c-gold">${r.trimmed}</td><td class="c-green">${r.action}</td></tr>
         `).join('');
       } else {
-        rb.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:18px;">Waiting for a coin to surge +${s.rebalance_trigger_pct}% above target weight...</td></tr>`;
+        rb.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:18px;">No harvests or rebalances yet.</td></tr>`;
       }
 
       document.getElementById('logBox').innerHTML = (s.logs || []).join('<br/>');
     } catch (e) {}
   }
 
-  setInterval(refresh, 5000);
+  setInterval(refresh, 3000);
   refresh();
 </script>
 </body>
