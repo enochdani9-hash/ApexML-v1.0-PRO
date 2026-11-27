@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "indexvault_100_v2_state.json"
+STATE_FILE = "indexvault_500_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -25,8 +25,8 @@ LEVERAGED_SUFFIXES = ("3L", "3S", "5L", "5S", "UP", "DOWN", "BULL", "BEAR")
 
 HTTP_SESSION = requests.Session()
 adapter = HTTPAdapter(
-    pool_connections=24,
-    pool_maxsize=24,
+    pool_connections=32,
+    pool_maxsize=32,
     max_retries=Retry(total=2, backoff_factor=0.2, status_forcelist=[502, 503, 504])
 )
 HTTP_SESSION.mount("https://", adapter)
@@ -34,24 +34,32 @@ HTTP_SESSION.mount("https://", adapter)
 PAIR_META_CACHE = {}
 PAIR_META_TS = 0.0
 
+JOB_STATUS = {
+    "running": False,
+    "title": "",
+    "done": 0,
+    "total": 0,
+    "error": ""
+}
+
 DEFAULT_STATE = {
     "mode": "PAPER",
     "auto_rebalance": True,
-    "target_coin_count": 100,
+    "target_coin_count": 500,       # Supports up to 600 coins
     "rebalance_trigger_pct": 25.0,
     "live_min_order_usdt": 5.0,
     "spot_fee_pct": 0.20,
     "api_key": os.environ.get("GATE_API_KEY", "").strip(),
     "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
     "api_connected": False,
-    "api_status_msg": "Paper Mode Active — Live 5s Price Feed & Top 100 Auto-Compounder",
+    "api_status_msg": "Paper Mode Active — Live 5s Price Feed & Top 500 Auto-Compounder",
     "live_spot_usdt": 0.0,
     "paper_cash_usdt": 100.0,
-    "harvested_usdt_vault": 0.0,    # Safely banked USDT from partial sells / profit harvests
+    "harvested_usdt_vault": 0.0,
     "total_deposited_usdt": 100.0,
     "compound_pool_usdt": 0.0,
     "holdings": {},
-    "equity_history": [],           # Live tick-by-tick equity points
+    "equity_history": [],
     "daily_open_equity": 100.0,
     "daily_open_date": "",
     "rebalance_ledger": [],
@@ -114,15 +122,17 @@ def load_state():
         except Exception as e:
             add_log(f"State load notice: {e}")
     else:
-        if os.path.exists("indexvault_100_state.json"):
-            try:
-                with open("indexvault_100_state.json", "r") as f:
-                    old_s = json.load(f)
-                    STATE.update(old_s)
-                    STATE.setdefault("harvested_usdt_vault", 0.0)
-                    STATE.setdefault("stats", {}).setdefault("total_harvests", 0)
-            except Exception:
-                pass
+        for old_fn in ["indexvault_100_v2_state.json", "indexvault_100_state.json"]:
+            if os.path.exists(old_fn):
+                try:
+                    with open(old_fn, "r") as f:
+                        old_s = json.load(f)
+                        STATE.update(old_s)
+                        STATE.setdefault("harvested_usdt_vault", 0.0)
+                        STATE.setdefault("stats", {}).setdefault("total_harvests", 0)
+                    break
+                except Exception:
+                    pass
 
     ek = os.environ.get("GATE_API_KEY", "").strip()
     es = os.environ.get("GATE_API_SECRET", "").strip()
@@ -143,7 +153,7 @@ def save_state():
 
 
 # =============================================================================
-# GATE.IO SPOT APIv4 HELPERS + AUTO-JUNK FILTER
+# GATE.IO SPOT APIv4 HELPERS + $25K LIQUIDITY & AUTO-JUNK FILTER
 # =============================================================================
 def gate_sign(method, url, query_string="", body_string="", custom_key=None, custom_secret=None):
     key = (custom_key if custom_key else STATE.get("api_key", "")).strip()
@@ -167,7 +177,7 @@ def refresh_pair_meta():
     if PAIR_META_CACHE and (now - PAIR_META_TS < 3600):
         return PAIR_META_CACHE
 
-    r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/currency_pairs", timeout=10)
+    r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/currency_pairs", timeout=12)
     r.raise_for_status()
     meta = {}
     for item in r.json():
@@ -176,7 +186,7 @@ def refresh_pair_meta():
             continue
         if item.get("trade_status") != "tradable":
             continue
-        if item.get("st_tag"):
+        if item.get("st_tag"):  # Blocks delisting / risk-flagged tokens
             continue
         base = item.get("base", "").upper()
         if base in STABLECOINS or base.endswith(LEVERAGED_SUFFIXES):
@@ -191,9 +201,9 @@ def refresh_pair_meta():
     return meta
 
 
-def fetch_top_index_candidates(limit=120):
+def fetch_top_index_candidates(limit=620):
     meta = refresh_pair_meta()
-    r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/tickers", timeout=8)
+    r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/tickers", timeout=10)
     r.raise_for_status()
     ranked = []
     for t in r.json():
@@ -202,7 +212,7 @@ def fetch_top_index_candidates(limit=120):
             continue
         last = float(t.get("last") or 0.0)
         qvol = float(t.get("quote_volume") or 0.0)
-        if last <= 0 or qvol < 150000:
+        if last <= 0 or qvol < 25000:  # $25k 24h liquidity floor for 500-600+ coins
             continue
         ranked.append({
             "pair": cp,
@@ -220,7 +230,7 @@ def fetch_top_index_candidates(limit=120):
 
 
 def fetch_all_spot_tickers():
-    r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/tickers", timeout=8)
+    r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/tickers", timeout=10)
     r.raise_for_status()
     out = {}
     for t in r.json():
@@ -285,12 +295,12 @@ def place_spot_market_sell(pair, coin_qty, prec=2):
 
 
 # =============================================================================
-# INDEX DEPLOYMENT & HARVEST-TO-USDT + REBUY ENGINE
+# BACKGROUND INDEX DEPLOYMENT & HARVEST-TO-USDT + REBUY ENGINE
 # =============================================================================
-def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
-    candidates = fetch_top_index_candidates(limit=max(110, target_count + 10))
+def deploy_index_basket(deposit_usdt, target_count=500, replace_existing=False):
+    candidates = fetch_top_index_candidates(limit=max(620, target_count + 20))
     if not candidates:
-        raise ValueError("Could not fetch Gate.io Top 100 market list.")
+        raise ValueError("Could not fetch Gate.io Top 500 market list.")
 
     with state_lock:
         mode = STATE.get("mode", "PAPER")
@@ -303,11 +313,14 @@ def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
 
     if mode == "PAPER":
         selected = candidates[:target_count]
-        per_coin = round(deposit_usdt / max(1, len(selected)), 4)
+        JOB_STATUS["total"] = len(selected)
+        JOB_STATUS["done"] = 0
+        per_coin = round(deposit_usdt / max(1, len(selected)), 6)
+
         with state_lock:
             if replace_existing:
                 STATE["holdings"] = {}
-            for c in selected:
+            for idx, c in enumerate(selected, start=1):
                 pair = c["pair"]
                 px = c["last"]
                 net_usdt = per_coin * (1.0 - fee_pct / 100.0)
@@ -317,10 +330,10 @@ def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
                     new_qty = float(existing["qty"]) + qty
                     new_cost = float(existing["cost_usdt"]) + per_coin
                     existing["qty"] = new_qty
-                    existing["cost_usdt"] = round(new_cost, 4)
+                    existing["cost_usdt"] = round(new_cost, 6)
                     existing["avg_price"] = new_cost / max(1e-12, new_qty)
                     existing["last_price"] = px
-                    existing["value_usdt"] = round(new_qty * px, 4)
+                    existing["value_usdt"] = round(new_qty * px, 6)
                     existing["change_24h"] = round(c["change_24h"], 2)
                     existing["rank"] = c["rank"]
                 else:
@@ -330,10 +343,10 @@ def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
                         "rank": c["rank"],
                         "qty": qty,
                         "avg_price": px,
-                        "cost_usdt": round(per_coin, 4),
+                        "cost_usdt": round(per_coin, 6),
                         "last_price": px,
-                        "value_usdt": round(net_usdt, 4),
-                        "pnl_usdt": round(net_usdt - per_coin, 4),
+                        "value_usdt": round(net_usdt, 6),
+                        "pnl_usdt": round(net_usdt - per_coin, 6),
                         "pnl_pct": round(-fee_pct, 2),
                         "change_24h": round(c["change_24h"], 2),
                         "min_quote_amount": c["min_quote_amount"],
@@ -342,10 +355,11 @@ def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
                     }
                 bought_count += 1
                 total_spent += per_coin
+                JOB_STATUS["done"] = idx
 
             if not replace_existing:
                 STATE["paper_cash_usdt"] = round(max(0.0, STATE.get("paper_cash_usdt", 0.0) - total_spent), 4)
-            add_log(f"🚀 [PAPER INDEX] Deployed ${total_spent:.2f} across {bought_count} Top Gate.io tokens (${per_coin:.2f}/coin).")
+            add_log(f"🚀 [PAPER INDEX] Deployed ${total_spent:.2f} across {bought_count} Top Gate.io tokens (${per_coin:.3f}/coin).")
             save_state()
     else:
         if not has_keys:
@@ -358,6 +372,10 @@ def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
         if replace_existing:
             with state_lock:
                 STATE["holdings"] = {}
+
+        est_coins = min(target_count, max(1, int(budget / live_floor)))
+        JOB_STATUS["total"] = est_coins
+        JOB_STATUS["done"] = 0
 
         remaining = budget
         for c in candidates[:target_count]:
@@ -398,7 +416,8 @@ def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
                 remaining -= req_amt
                 total_spent += req_amt
                 bought_count += 1
-                time.sleep(0.12)
+                JOB_STATUS["done"] = bought_count
+                time.sleep(0.10)
 
         with state_lock:
             STATE["live_spot_usdt"] = round(max(0.0, avail_usdt - total_spent), 4)
@@ -408,73 +427,96 @@ def deploy_index_basket(deposit_usdt, target_count=100, replace_existing=False):
     return bought_count, round(total_spent, 2)
 
 
-def execute_harvest_and_rebuy(sell_pct=None, profit_only=False):
-    with state_lock:
-        mode = STATE.get("mode", "PAPER")
-        holdings = STATE.get("holdings", {})
-        if not holdings:
-            raise ValueError("No active coins in your Index Basket to harvest.")
-        total_val = sum(float(h.get("value_usdt", 0.0)) for h in holdings.values())
-        deposited = float(STATE.get("total_deposited_usdt", 100.0))
-        fee_pct = float(STATE.get("spot_fee_pct", 0.20))
-        target_cnt = int(STATE.get("target_coin_count", 100))
-        has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
-
-    if total_val <= 1.0:
-        raise ValueError("Basket value is too small to harvest.")
-
-    if profit_only:
-        profit_avail = round(total_val - deposited, 4)
-        if profit_avail <= 0.10:
-            raise ValueError(f"Basket (${total_val:.2f}) has no net profit above your ${deposited:.2f} deposit yet.")
-        harvest_gross = profit_avail
-        actual_pct = round((harvest_gross / total_val) * 100.0, 2)
-    else:
-        actual_pct = max(1.0, min(95.0, float(sell_pct or 10.0)))
-        harvest_gross = round(total_val * (actual_pct / 100.0), 4)
-
-    reinvest_usdt = round(total_val - harvest_gross, 4)
-    if reinvest_usdt < 5.0:
-        raise ValueError("Remaining reinvest balance would be under $5.00. Lower your sell percentage.")
-
-    if mode == "LIVE":
-        if not has_keys:
-            raise ValueError("Connect Gate.io Spot API keys first for Live Harvest.")
-        # Sell current live holdings to USDT, keep harvested portion, re-deploy reinvest_usdt
+def bg_deploy_task(amt, cnt):
+    try:
+        JOB_STATUS.update({"running": True, "title": f"Deploying ${amt:.2f} across Top {cnt} Coins", "done": 0, "total": cnt, "error": ""})
+        deploy_index_basket(amt, cnt, replace_existing=False)
+        run_index_cycle(force_manual=True)
+    except Exception as e:
+        JOB_STATUS["error"] = str(e)
         with state_lock:
-            to_sell = list(STATE["holdings"].values())
-        for h in to_sell:
-            place_spot_market_sell(h["pair"], float(h["qty"]), int(h.get("amount_precision", 2)))
-            time.sleep(0.08)
+            add_log(f"⚠️ Deploy error: {str(e)[:80]}")
+    finally:
+        JOB_STATUS["running"] = False
 
-    harvest_net = round(harvest_gross * (1.0 - fee_pct / 100.0), 4)
 
-    # Immediately re-buy fresh Top N coins with the remaining balance
-    bought_cnt, spent = deploy_index_basket(reinvest_usdt, target_count=target_cnt, replace_existing=True)
+def bg_harvest_task(sell_pct, profit_only):
+    try:
+        JOB_STATUS.update({"running": True, "title": "Harvesting to USDT Vault & Rebuying Basket", "done": 0, "total": 100, "error": ""})
+        with state_lock:
+            mode = STATE.get("mode", "PAPER")
+            holdings = STATE.get("holdings", {})
+            if not holdings:
+                raise ValueError("No active coins in your Index Basket to harvest.")
+            total_val = sum(float(h.get("value_usdt", 0.0)) for h in holdings.values())
+            deposited = float(STATE.get("total_deposited_usdt", 100.0))
+            fee_pct = float(STATE.get("spot_fee_pct", 0.20))
+            target_cnt = int(STATE.get("target_coin_count", 500))
+            has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
 
-    with state_lock:
-        STATE["harvested_usdt_vault"] = round(STATE.get("harvested_usdt_vault", 0.0) + harvest_net, 4)
-        STATE["stats"]["total_harvests"] = int(STATE["stats"].get("total_harvests", 0)) + 1
-        STATE["rebalance_ledger"].insert(0, {
-            "time": datetime.utcnow().strftime("%H:%M:%S"),
-            "winner": f"HARVEST ({actual_pct:.1f}%)",
-            "trimmed": f"+${harvest_net:.2f} USDT",
-            "action": f"Locked in Vault & Re-Bought {bought_cnt} Coins (${spent:.2f})"
-        })
-        STATE["rebalance_ledger"] = STATE["rebalance_ledger"][:40]
-        add_log(
-            f"💰🔒 [HARVEST & REBUY] Sold {actual_pct:.1f}% (+${harvest_net:.2f} locked in USDT Vault) → "
-            f"Re-bought {bought_cnt} Top coins with ${spent:.2f}!"
-        )
-        save_state()
+        if total_val <= 1.0:
+            raise ValueError("Basket value is too small to harvest.")
 
-    return harvest_net, bought_cnt, spent
+        if profit_only:
+            profit_avail = round(total_val - deposited, 4)
+            if profit_avail <= 0.10:
+                raise ValueError(f"Basket (${total_val:.2f}) has no net profit above your ${deposited:.2f} deposit yet.")
+            harvest_gross = profit_avail
+            actual_pct = round((harvest_gross / total_val) * 100.0, 2)
+        else:
+            actual_pct = max(1.0, min(95.0, float(sell_pct or 10.0)))
+            harvest_gross = round(total_val * (actual_pct / 100.0), 4)
+
+        reinvest_usdt = round(total_val - harvest_gross, 4)
+        if reinvest_usdt < 5.0:
+            raise ValueError("Remaining reinvest balance would be under $5.00. Lower your sell percentage.")
+
+        if mode == "LIVE":
+            if not has_keys:
+                raise ValueError("Connect Gate.io Spot API keys first for Live Harvest.")
+            with state_lock:
+                to_sell = list(STATE["holdings"].values())
+            JOB_STATUS["title"] = f"Selling {len(to_sell)} Live Coins to USDT"
+            JOB_STATUS["total"] = len(to_sell)
+            for idx, h in enumerate(to_sell, start=1):
+                place_spot_market_sell(h["pair"], float(h["qty"]), int(h.get("amount_precision", 2)))
+                JOB_STATUS["done"] = idx
+                time.sleep(0.08)
+
+        harvest_net = round(harvest_gross * (1.0 - fee_pct / 100.0), 4)
+        JOB_STATUS["title"] = f"Rebuying Top {target_cnt} Coins (${reinvest_usdt:.2f})"
+        bought_cnt, spent = deploy_index_basket(reinvest_usdt, target_count=target_cnt, replace_existing=True)
+
+        with state_lock:
+            STATE["harvested_usdt_vault"] = round(STATE.get("harvested_usdt_vault", 0.0) + harvest_net, 4)
+            STATE["stats"]["total_harvests"] = int(STATE["stats"].get("total_harvests", 0)) + 1
+            STATE["rebalance_ledger"].insert(0, {
+                "time": datetime.utcnow().strftime("%H:%M:%S"),
+                "winner": f"HARVEST ({actual_pct:.1f}%)",
+                "trimmed": f"+${harvest_net:.2f} USDT",
+                "action": f"Locked in Vault & Re-Bought {bought_cnt} Coins (${spent:.2f})"
+            })
+            STATE["rebalance_ledger"] = STATE["rebalance_ledger"][:40]
+            add_log(
+                f"💰🔒 [HARVEST & REBUY] Sold {actual_pct:.1f}% (+${harvest_net:.2f} locked in USDT Vault) → "
+                f"Re-bought {bought_cnt} Top coins with ${spent:.2f}!"
+            )
+            save_state()
+        run_index_cycle(force_manual=True)
+    except Exception as e:
+        JOB_STATUS["error"] = str(e)
+        with state_lock:
+            add_log(f"⚠️ Harvest error: {str(e)[:80]}")
+    finally:
+        JOB_STATUS["running"] = False
 
 
 # =============================================================================
 # LIVE 5-SECOND TICKER & EQUITY CURVE ENGINE
 # =============================================================================
 def run_index_cycle(force_manual=False):
+    if JOB_STATUS.get("running"):
+        return
     if not cycle_lock.acquire(blocking=force_manual):
         return
 
@@ -514,11 +556,11 @@ def run_index_cycle(force_manual=False):
                     h["last_price"] = px
                     h["change_24h"] = round(tk["change_24h"], 2)
                 val = float(h["qty"]) * float(h["last_price"])
-                cost = max(0.0001, float(h["cost_usdt"]))
+                cost = max(0.000001, float(h["cost_usdt"]))
                 pnl_u = val - cost
                 pnl_p = (pnl_u / cost) * 100.0
-                h["value_usdt"] = round(val, 4)
-                h["pnl_usdt"] = round(pnl_u, 4)
+                h["value_usdt"] = round(val, 6)
+                h["pnl_usdt"] = round(pnl_u, 6)
                 h["pnl_pct"] = round(pnl_p, 2)
                 total_holdings_val += val
 
@@ -532,8 +574,8 @@ def run_index_cycle(force_manual=False):
                 laggards = sorted(holdings.values(), key=lambda x: x["pnl_pct"])
 
                 for w in winners[:3]:
-                    trim_usdt = round(w["value_usdt"] - target_weight_val, 4)
-                    if trim_usdt < 0.05:
+                    trim_usdt = round(w["value_usdt"] - target_weight_val, 6)
+                    if trim_usdt < 0.02:
                         continue
                     if mode == "LIVE" and trim_usdt < max(live_floor, float(w.get("min_quote_amount", 3.0))):
                         continue
@@ -544,9 +586,9 @@ def run_index_cycle(force_manual=False):
                         if code not in (200, 201):
                             continue
 
-                    net_trimmed = round(trim_usdt * (1.0 - fee_pct / 100.0), 4)
+                    net_trimmed = round(trim_usdt * (1.0 - fee_pct / 100.0), 6)
                     w["qty"] = max(0.0, float(w["qty"]) - trim_qty)
-                    w["value_usdt"] = round(w["qty"] * float(w["last_price"]), 4)
+                    w["value_usdt"] = round(w["qty"] * float(w["last_price"]), 6)
                     w["rebalances"] = int(w.get("rebalances", 0)) + 1
 
                     target_lag = laggards[0] if laggards and laggards[0]["pair"] != w["pair"] else None
@@ -560,8 +602,8 @@ def run_index_cycle(force_manual=False):
                             buy_net = net_trimmed * (1.0 - fee_pct / 100.0)
                             add_qty = buy_net / max(1e-12, float(target_lag["last_price"]))
                             target_lag["qty"] = float(target_lag["qty"]) + add_qty
-                            target_lag["cost_usdt"] = round(float(target_lag["cost_usdt"]) + net_trimmed, 4)
-                            target_lag["value_usdt"] = round(target_lag["qty"] * float(target_lag["last_price"]), 4)
+                            target_lag["cost_usdt"] = round(float(target_lag["cost_usdt"]) + net_trimmed, 6)
+                            target_lag["value_usdt"] = round(target_lag["qty"] * float(target_lag["last_price"]), 6)
                             reinvest_note = f"Bought Dip -> {target_lag['base']}"
                         else:
                             STATE["compound_pool_usdt"] = round(STATE.get("compound_pool_usdt", 0.0) + net_trimmed, 4)
@@ -581,7 +623,7 @@ def run_index_cycle(force_manual=False):
                     STATE["rebalance_ledger"] = STATE["rebalance_ledger"][:40]
                     add_log(f"♻️ [COMPOUND] Trimmed +${net_trimmed:.2f} from {w['pair']} (+{w['pnl_pct']}%) → {reinvest_note}")
 
-            # REAL-TIME EQUITY CURVE (RECORDS ON EVERY PRICE CHANGE!)
+            # REAL-TIME EQUITY CURVE (RECORDS ON EVERY PRICE CHANGE)
             cash_val = float(STATE.get("live_spot_usdt", 0.0)) if mode == "LIVE" else float(STATE.get("paper_cash_usdt", 0.0))
             pool_val = float(STATE.get("compound_pool_usdt", 0.0))
             vault_val = float(STATE.get("harvested_usdt_vault", 0.0))
@@ -608,7 +650,7 @@ def run_index_cycle(force_manual=False):
                     "pnl_usdt": total_pnl,
                     "pnl_pct": total_pnl_pct
                 })
-                STATE["equity_history"] = hist[-180:]  # Smooth rolling live curve
+                STATE["equity_history"] = hist[-180:]
 
             STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
             STATE["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
@@ -620,7 +662,7 @@ def run_index_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("🏛️ IndexVault 100 v2.0 PRO Online — Live 5s Equity Curve + Harvest & Rebuy Engine Ready.")
+    add_log("🏛️ IndexVault 500 PRO Online — Up to 600 Coins + Background Deploy + Paginated UI.")
     while True:
         run_index_cycle(force_manual=False)
         time.sleep(5.0)
@@ -646,8 +688,8 @@ def check_worker():
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
-        "name": "IndexVault 100 v2.0 PRO",
-        "short_name": "IndexVault",
+        "name": "IndexVault 500 PRO",
+        "short_name": "IndexVault 500",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#04060a",
@@ -681,14 +723,17 @@ def api_state():
         safe = STATE.copy()
         safe["api_key"] = ""
         safe["api_secret"] = ""
+        safe["job"] = JOB_STATUS.copy()
         return jsonify(safe)
 
 
 @app.route("/api/deploy_index", methods=["POST"])
 def api_deploy_index():
+    if JOB_STATUS.get("running"):
+        return jsonify({"ok": False, "error": "A background job is already running. Please wait a few seconds."}), 400
     d = request.json or {}
     amt = max(10.0, float(d.get("amount_usdt") or 100.0))
-    cnt = max(5, min(120, int(float(d.get("coin_count") or 100))))
+    cnt = max(5, min(600, int(float(d.get("coin_count") or 500))))
     with state_lock:
         if STATE.get("mode") == "PAPER":
             if len(STATE.get("holdings", {})) == 0:
@@ -704,25 +749,19 @@ def api_deploy_index():
         STATE["target_coin_count"] = cnt
         save_state()
 
-    try:
-        bought, spent = deploy_index_basket(amt, cnt, replace_existing=False)
-        run_index_cycle(force_manual=True)
-        return jsonify({"ok": True, "bought": bought, "spent": spent})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+    threading.Thread(target=bg_deploy_task, args=(amt, cnt), daemon=True).start()
+    return jsonify({"ok": True, "started": True})
 
 
 @app.route("/api/harvest_and_rebuy", methods=["POST"])
 def api_harvest_and_rebuy():
+    if JOB_STATUS.get("running"):
+        return jsonify({"ok": False, "error": "A background job is already running. Please wait."}), 400
     d = request.json or {}
     profit_only = bool(d.get("profit_only", False))
     sell_pct = d.get("sell_pct", 10.0)
-    try:
-        harvested, bought_cnt, spent = execute_harvest_and_rebuy(sell_pct=sell_pct, profit_only=profit_only)
-        run_index_cycle(force_manual=True)
-        return jsonify({"ok": True, "harvested": harvested, "bought": bought_cnt, "spent": spent})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
+    threading.Thread(target=bg_harvest_task, args=(sell_pct, profit_only), daemon=True).start()
+    return jsonify({"ok": True, "started": True})
 
 
 @app.route("/api/toggle_mode", methods=["POST"])
@@ -812,7 +851,7 @@ def api_sync_keys():
 
 
 # =============================================================================
-# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — INDEXVAULT 100 v2.0 PRO
+# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — INDEXVAULT 500 PRO
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -826,7 +865,7 @@ HTML_UI = """
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet" />
-  <title>IndexVault 100 v2.0 PRO | Live Crypto S&P 500</title>
+  <title>IndexVault 500 PRO | Crypto S&P 500</title>
   <style>
     :root {
       --bg: #04060a;
@@ -869,7 +908,7 @@ HTML_UI = """
       border: 1px solid rgba(245, 158, 11, 0.42);
       border-radius: 20px;
       padding: 20px 24px;
-      margin-bottom: 18px;
+      margin-bottom: 16px;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255,255,255,0.08);
     }
     .topbar-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 14px; }
@@ -887,6 +926,15 @@ HTML_UI = """
     }
     @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.8); } }
 
+    /* BACKGROUND JOB PROGRESS BANNER */
+    .job-banner {
+      display: none; background: linear-gradient(135deg, rgba(245, 158, 11, 0.14), rgba(0, 245, 160, 0.10));
+      border: 1px solid rgba(245, 158, 11, 0.45); border-radius: 14px; padding: 14px 18px; margin-bottom: 16px;
+    }
+    .job-banner.active { display: block; }
+    .job-track { height: 8px; background: rgba(255,255,255,0.08); border-radius: 99px; overflow: hidden; margin-top: 8px; }
+    .job-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--gold), var(--green)); transition: width 0.3s ease; }
+
     .actions { display: flex; flex-wrap: wrap; gap: 8px; }
     .btn {
       cursor: pointer; border: none; border-radius: 11px; padding: 9px 14px;
@@ -895,6 +943,7 @@ HTML_UI = """
     }
     .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
     .btn:active { transform: scale(0.97); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
     .btn-gold { background: linear-gradient(135deg, var(--gold), #fbbf24); color: #1a1000; box-shadow: 0 4px 16px rgba(245, 158, 11, 0.3); }
     .btn-green { background: linear-gradient(135deg, var(--green), var(--cyan)); color: #041c15; box-shadow: 0 4px 16px rgba(0, 245, 160, 0.25); }
     .btn-ghost { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: var(--text); }
@@ -926,7 +975,6 @@ HTML_UI = """
       letter-spacing: 0.8px; color: #cbd5e1;
     }
 
-    /* LIVE CHART BOX */
     .chart-wrap {
       background: rgba(4, 6, 12, 0.78); border: 1px solid rgba(255,255,255,0.07);
       border-radius: 14px; padding: 14px 16px; height: 235px; position: relative;
@@ -938,7 +986,6 @@ HTML_UI = """
       padding: 4px 10px; border-radius: 99px; color: var(--muted);
     }
 
-    /* HARVEST PANEL */
     .harvest-box {
       background: linear-gradient(135deg, rgba(0, 245, 160, 0.07), rgba(56, 189, 248, 0.05));
       border: 1px solid rgba(0, 245, 160, 0.30); border-radius: 14px; padding: 14px; margin-bottom: 14px;
@@ -955,7 +1002,6 @@ HTML_UI = """
       display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px;
     }
 
-    /* MOVERS */
     .movers-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
     @media (max-width: 600px) { .movers-grid { grid-template-columns: 1fr; } }
     .mover-box {
@@ -977,6 +1023,11 @@ HTML_UI = """
     th, td { padding: 9px 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: var(--mono); }
     th { font-family: 'Inter', sans-serif; color: var(--muted); font-size: 0.65rem; text-transform: uppercase; font-weight: 800; position: sticky; top: 0; background: #0c101b; }
 
+    .pager {
+      display: flex; justify-content: space-between; align-items: center; margin-top: 12px;
+      padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); font-size: 0.75rem; color: var(--muted);
+    }
+
     .logs {
       background: rgba(4, 6, 11, 0.92); border: 1px solid var(--border); border-radius: 12px;
       padding: 12px 14px; height: 185px; overflow-y: auto; font-family: var(--mono);
@@ -995,8 +1046,8 @@ HTML_UI = """
   <div class="topbar">
     <div class="topbar-row">
       <div>
-        <div class="brand">🏛️ INDEXVAULT 100 <span class="tag">v2.0 PRO • LIVE TICKER</span></div>
-        <div class="subtitle"><span class="pulse-dot"></span><span id="statusLine">Live 5s Equity Curve • Harvest % to USDT & Rebuy Top 100</span></div>
+        <div class="brand">🏛️ INDEXVAULT 500 <span class="tag">PRO • UP TO 600 COINS</span></div>
+        <div class="subtitle"><span class="pulse-dot"></span><span id="statusLine">Live 5s Equity Curve • $25k Liquidity Filter • Background Deploy</span></div>
       </div>
       <div class="actions">
         <button class="btn btn-green" onclick="installApp()">📲 Install App</button>
@@ -1005,6 +1056,15 @@ HTML_UI = """
         <button class="btn btn-ghost" onclick="sweepNow()">⚡ Refresh</button>
       </div>
     </div>
+  </div>
+
+  <!-- LIVE BACKGROUND JOB PROGRESS BAR -->
+  <div class="job-banner" id="jobBanner">
+    <div style="display:flex;justify-content:space-between;align-items:center;font-size:0.8rem;font-weight:800;">
+      <span class="c-gold" id="jobTitle">⏳ Running Background Task...</span>
+      <span style="font-family:var(--mono);" id="jobPct">0 / 500 (0%)</span>
+    </div>
+    <div class="job-track"><div class="job-fill" id="jobFill"></div></div>
   </div>
 
   <!-- 4 KPI CARDS -->
@@ -1039,7 +1099,7 @@ HTML_UI = """
         <span id="lastUpd" style="font-family:var(--mono);color:var(--green);">--:--:--</span>
       </div>
       <div class="chart-wrap" id="chartWrap">
-        <div style="text-align:center;color:var(--muted);padding-top:85px;font-size:0.82rem;">Deploy your basket on the right to watch your live Equity Curve move tick-by-tick.</div>
+        <div style="text-align:center;color:var(--muted);padding-top:85px;font-size:0.82rem;">Deploy your 500-coin basket on the right to watch your live Equity Curve move tick-by-tick.</div>
       </div>
       <div class="movers-grid">
         <div class="mover-box">
@@ -1054,9 +1114,9 @@ HTML_UI = """
     </div>
 
     <div class="card">
-      <!-- HARVEST % TO USDT & REBUY ALL 100 COINS -->
+      <!-- HARVEST % TO USDT & REBUY ALL COINS -->
       <div class="harvest-box">
-        <div class="sec-head" style="margin-bottom:8px;color:var(--green);"><span>💰 Harvest % to USDT & Rebuy All 100 Coins</span></div>
+        <div class="sec-head" style="margin-bottom:8px;color:var(--green);"><span>💰 Harvest % to USDT & Rebuy Full Basket</span></div>
         <div class="chip-row">
           <span class="chip" onclick="setHarvestPct(5)">5%</span>
           <span class="chip" onclick="setHarvestPct(10)">10%</span>
@@ -1066,11 +1126,11 @@ HTML_UI = """
         </div>
         <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin-bottom:8px;">
           <input type="number" id="harvPctInput" value="10" min="1" max="95" step="1" oninput="updateHarvestPreview()" placeholder="Sell %" />
-          <button class="btn btn-green" onclick="runHarvest()" id="harvBtn">🔒 Sell % & Rebuy 100</button>
+          <button class="btn btn-green" onclick="runHarvest()" id="harvBtn">🔒 Sell % & Rebuy</button>
         </div>
         <div class="preview-strip">
           <span>Lock to USDT: <strong class="c-green" id="prevLock">$0.00</strong></span>
-          <span>Rebuy 100 Coins: <strong class="c-gold" id="prevRebuy">$0.00</strong></span>
+          <span>Rebuy Basket: <strong class="c-gold" id="prevRebuy">$0.00</strong></span>
         </div>
       </div>
 
@@ -1078,9 +1138,9 @@ HTML_UI = """
       <div class="sec-head"><span>🚀 Launch / Add Cash to Index Basket</span></div>
       <div class="form-grid-2">
         <div><label>Deposit Amount (USDT)</label><input type="number" id="depInput" value="100" step="10" /></div>
-        <div><label>Target Coins (Max 100)</label><input type="number" id="cntInput" value="100" min="5" max="120" /></div>
+        <div><label>Target Coins (Max 600)</label><input type="number" id="cntInput" value="500" min="5" max="600" /></div>
       </div>
-      <button class="btn btn-gold" style="width:100%;justify-content:center;padding:11px;margin-bottom:14px;" onclick="deployIndex()" id="deployBtn">🏛️ Buy Top 100 Index Basket Now</button>
+      <button class="btn btn-gold" style="width:100%;justify-content:center;padding:11px;margin-bottom:14px;" onclick="deployIndex()" id="deployBtn">🏛️ Buy Top 500 Index Basket Now</button>
 
       <div class="sec-head"><span>⚙️ Rules & Gate.io Spot API</span></div>
       <div class="form-grid-2">
@@ -1099,13 +1159,13 @@ HTML_UI = """
     </div>
   </div>
 
-  <!-- 100-COIN HOLDINGS TABLE -->
+  <!-- PAGINATED 500-COIN HOLDINGS TABLE -->
   <div class="card" style="margin-bottom:18px;">
     <div class="sec-head">
-      <span>💎 Live Index Basket Holdings</span>
-      <input type="text" id="searchBox" placeholder="Filter coin (e.g. BTC, SOL, SUI)..." style="width:220px;padding:6px 10px;font-size:0.75rem;" oninput="renderHoldings()" />
+      <span>💎 Live Index Basket Holdings (50 / Page)</span>
+      <input type="text" id="searchBox" placeholder="Search 500+ coins (e.g. BTC, SOL, SUI)..." style="width:240px;padding:6px 10px;font-size:0.75rem;" oninput="currentPage=1; renderHoldings();" />
     </div>
-    <div style="max-height:340px;overflow-y:auto;">
+    <div style="max-height:380px;overflow-y:auto;">
       <table>
         <thead>
           <tr>
@@ -1122,6 +1182,11 @@ HTML_UI = """
         <tbody id="holdingsBody"></tbody>
       </table>
     </div>
+    <div class="pager">
+      <button class="btn btn-ghost" style="padding:6px 12px;" id="prevBtn" onclick="changePage(-1)">◀ Prev</button>
+      <span id="pageInfo" style="font-family:var(--mono);">Page 1 of 1 (0 coins)</span>
+      <button class="btn btn-ghost" style="padding:6px 12px;" id="nextBtn" onclick="changePage(1)">Next ▶</button>
+    </div>
   </div>
 
   <!-- HARVEST / REBALANCE LEDGER & TELEMETRY -->
@@ -1136,7 +1201,7 @@ HTML_UI = """
       </div>
     </div>
     <div class="card">
-      <div class="sec-head"><span>🖥️ IndexVault Live Telemetry</span></div>
+      <div class="sec-head"><span>🖥️ IndexVault 500 Telemetry</span></div>
       <div class="logs" id="logBox"></div>
     </div>
   </div>
@@ -1178,49 +1243,37 @@ HTML_UI = """
 
   async function runHarvest() {
     const pct = Number(document.getElementById('harvPctInput').value || 10);
-    const btn = document.getElementById('harvBtn');
-    btn.innerText = '⏳ Harvesting...';
     const r = await fetch('/api/harvest_and_rebuy', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ sell_pct: pct, profit_only: false })
     });
     const d = await r.json();
-    if (d.ok) alert(`Locked +$${d.harvested} USDT in your Vault & re-bought ${d.bought} Top coins with $${d.spent}!`);
-    else alert('Notice: ' + (d.error || 'Could not harvest'));
-    btn.innerText = '🔒 Sell % & Rebuy 100';
+    if (!d.ok) alert('Notice: ' + (d.error || 'Could not start harvest'));
     await refresh();
   }
 
   async function harvestProfitOnly() {
-    const btn = document.getElementById('harvBtn');
-    btn.innerText = '⏳ Harvesting...';
     const r = await fetch('/api/harvest_and_rebuy', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ profit_only: true })
     });
     const d = await r.json();
-    if (d.ok) alert(`Harvested +$${d.harvested} pure profit to USDT Vault & re-bought ${d.bought} Top coins!`);
-    else alert('Notice: ' + (d.error || 'No net profit to harvest yet'));
-    btn.innerText = '🔒 Sell % & Rebuy 100';
+    if (!d.ok) alert('Notice: ' + (d.error || 'Could not start harvest'));
     await refresh();
   }
 
   async function deployIndex() {
-    const btn = document.getElementById('deployBtn');
     const amt = document.getElementById('depInput').value || 100;
-    const cnt = document.getElementById('cntInput').value || 100;
-    btn.innerText = '⏳ Buying Basket...';
+    const cnt = document.getElementById('cntInput').value || 500;
     const r = await fetch('/api/deploy_index', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ amount_usdt: amt, coin_count: cnt })
     });
     const d = await r.json();
-    if (d.ok) alert(`Deployed $${d.spent} across ${d.bought} Top Gate.io tokens!`);
-    else alert('Notice: ' + (d.error || 'Failed to deploy'));
-    btn.innerText = '🏛️ Buy Top 100 Index Basket Now';
+    if (!d.ok) alert('Notice: ' + (d.error || 'Failed to start deployment'));
     await refresh();
   }
 
@@ -1250,6 +1303,7 @@ HTML_UI = """
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ amount_usdt: amt })
     });
+    currentPage = 1;
     await refresh();
   }
   async function syncKeys() {
@@ -1322,23 +1376,42 @@ HTML_UI = """
   }
 
   let latestHoldings = [];
+  let currentPage = 1;
+  const PAGE_SIZE = 50;
+
+  function changePage(delta) {
+    currentPage += delta;
+    renderHoldings();
+  }
+
   function renderHoldings() {
     const q = (document.getElementById('searchBox').value || '').trim().toUpperCase();
     const list = q ? latestHoldings.filter(h => h.pair.includes(q)) : latestHoldings;
+    const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+    if (currentPage > totalPages) currentPage = totalPages;
+    if (currentPage < 1) currentPage = 1;
+
+    const start = (currentPage - 1) * PAGE_SIZE;
+    const pageItems = list.slice(start, start + PAGE_SIZE);
+
+    document.getElementById('pageInfo').innerText = `Page ${currentPage} of ${totalPages} (${list.length} coins)`;
+    document.getElementById('prevBtn').disabled = currentPage <= 1;
+    document.getElementById('nextBtn').disabled = currentPage >= totalPages;
+
     const body = document.getElementById('holdingsBody');
-    if (list.length === 0) {
-      body.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">No coins in basket yet — click "🏛️ Buy Top 100 Index Basket Now" above.</td></tr>`;
+    if (pageItems.length === 0) {
+      body.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">No coins in basket yet — click "🏛️ Buy Top 500 Index Basket Now" above.</td></tr>`;
       return;
     }
-    body.innerHTML = list.map(h => `
+    body.innerHTML = pageItems.map(h => `
       <tr>
         <td style="color:var(--muted);">#${h.rank || '-'}</td>
         <td><strong>${h.pair}</strong></td>
         <td>${fmtPx(h.last_price)}</td>
         <td class="${h.change_24h >= 0 ? 'c-green' : 'c-red'}">${h.change_24h >= 0 ? '+' : ''}${Number(h.change_24h).toFixed(2)}%</td>
-        <td>$${Number(h.cost_usdt).toFixed(2)}</td>
-        <td><strong>$${Number(h.value_usdt).toFixed(2)}</strong></td>
-        <td class="${h.pnl_usdt >= 0 ? 'c-green' : 'c-red'}"><strong>${h.pnl_usdt >= 0 ? '+' : ''}$${Number(h.pnl_usdt).toFixed(2)} (${h.pnl_pct >= 0 ? '+' : ''}${h.pnl_pct}%)</strong></td>
+        <td>$${Number(h.cost_usdt).toFixed(3)}</td>
+        <td><strong>$${Number(h.value_usdt).toFixed(3)}</strong></td>
+        <td class="${h.pnl_usdt >= 0 ? 'c-green' : 'c-red'}"><strong>${h.pnl_usdt >= 0 ? '+' : ''}$${Number(h.pnl_usdt).toFixed(3)} (${h.pnl_pct >= 0 ? '+' : ''}${h.pnl_pct}%)</strong></td>
         <td class="c-gold">${h.rebalances || 0}</td>
       </tr>
     `).join('');
@@ -1353,7 +1426,27 @@ HTML_UI = """
       if (!cfgLoaded) {
         document.getElementById('cfgTrig').value = s.rebalance_trigger_pct || 25;
         document.getElementById('cfgMin').value = s.live_min_order_usdt || 5;
+        document.getElementById('cntInput').value = s.target_coin_count || 500;
         cfgLoaded = true;
+      }
+
+      // Background Job Progress Banner
+      const job = s.job || {};
+      const banner = document.getElementById('jobBanner');
+      if (job.running) {
+        banner.classList.add('active');
+        const tot = Math.max(1, Number(job.total || 1));
+        const done = Number(job.done || 0);
+        const pct = Math.min(100, Math.round((done / tot) * 100));
+        document.getElementById('jobTitle').innerText = '⏳ ' + (job.title || 'Processing...');
+        document.getElementById('jobPct').innerText = `${done} / ${tot} (${pct}%)`;
+        document.getElementById('jobFill').style.width = pct + '%';
+        document.getElementById('deployBtn').disabled = true;
+        document.getElementById('harvBtn').disabled = true;
+      } else {
+        banner.classList.remove('active');
+        document.getElementById('deployBtn').disabled = false;
+        document.getElementById('harvBtn').disabled = false;
       }
 
       document.getElementById('statusLine').innerText = s.api_status_msg;
@@ -1427,7 +1520,7 @@ HTML_UI = """
     } catch (e) {}
   }
 
-  setInterval(refresh, 3000);
+  setInterval(refresh, 2500);
   refresh();
 </script>
 </body>
